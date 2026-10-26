@@ -518,6 +518,122 @@ SCENARIOS.update(TLS_SCENARIOS)
 # as does a build thrown away for one that is linked in full.
 ONE_ROUND = set(STATICS_SCENARIOS) | set(TLS_SCENARIOS)
 
+# axum's `Body::from_stream` handed `stream.map(Ok)` (#369): the library, which rustc compiles,
+# asks for the `TypeId` of `Option<StreamBody<..>>` through `dyn Any` as axum-core's
+# `try_downcast` does, and the type holds an enum variant's constructor used as a function, a
+# function item and a closure and coroutine of the program. Unhashed, the edited function and so
+# `serve` were refused and the edit went to cargo. `envelope` is generic, so its first edit is built
+# in full (spliced whole on Linux) and the next one a patch of that.
+TYPEID_MAIN = """\
+use std::convert::Infallible;
+use std::future::Future;
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(it) = future.as_mut().poll(&mut cx) {
+            return it;
+        }
+    }
+}
+
+fn envelope<F>(work: F) -> dep::Body
+where
+    F: Future<Output = u64> + 'static,
+{
+    let first = 1;
+    let head = std::iter::once_with(move || Ok::<_, Infallible>(first));
+    let tail = std::iter::once(work).map(block_on).map(Ok::<_, Infallible>);
+    dep::Body::from_stream(head.chain(tail))
+}
+
+fn serve() -> dep::Body {
+    let make = |n: u64| envelope(async move { n * 5 });
+    make(2)
+}
+
+fn main() {
+    let filled = [7u8; 4096];
+    std::hint::black_box(&filled);
+    let body = serve();
+    println!("parts {:?} streamed {}", body.parts(), body.streamed());
+    let again = dep::Body::new(body);
+    println!("again {:?} streamed {}", again.parts(), again.streamed());
+    if std::env::args().nth(1).is_some_and(|it| it == "panic") {
+        panic!("failed with {}", again.parts().len());
+    }
+}
+"""
+TYPEID_DEP = """\
+use std::any::Any;
+use std::convert::Infallible;
+
+/// axum-core's: `k` as a `T` when it is one, which `Body::new` asks of every body it is given.
+pub fn try_downcast<T: 'static, K: 'static>(k: K) -> Result<T, K> {
+    let mut k = Some(k);
+    if let Some(k) = <dyn Any>::downcast_mut::<Option<T>>(&mut k) {
+        Ok(k.take().unwrap())
+    } else {
+        Err(k.unwrap())
+    }
+}
+
+pub struct StreamBody<S>(S);
+
+pub struct Body {
+    parts: Vec<u64>,
+    streamed: bool,
+}
+
+impl Body {
+    pub fn new<B: IntoIterator<Item = Result<u64, Infallible>> + 'static>(body: B) -> Body {
+        try_downcast::<Body, B>(body).unwrap_or_else(|body| Body {
+            parts: body.into_iter().map(|it| it.unwrap_or_else(|never| match never {})).collect(),
+            streamed: false,
+        })
+    }
+
+    pub fn from_stream<S: Iterator<Item = Result<u64, Infallible>> + 'static>(stream: S) -> Body {
+        let mut body = Body::new(StreamBody(stream));
+        body.streamed = true;
+        body
+    }
+
+    pub fn parts(&self) -> &[u64] {
+        &self.parts
+    }
+
+    pub fn streamed(&self) -> bool {
+        self.streamed
+    }
+}
+
+impl<S: Iterator<Item = Result<u64, Infallible>>> IntoIterator for StreamBody<S> {
+    type Item = S::Item;
+    type IntoIter = S;
+
+    fn into_iter(self) -> S {
+        self.0
+    }
+}
+
+impl IntoIterator for Body {
+    type Item = Result<u64, Infallible>;
+    type IntoIter = std::iter::Map<std::vec::IntoIter<u64>, fn(u64) -> Result<u64, Infallible>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.parts.into_iter().map(Ok as fn(u64) -> Result<u64, Infallible>)
+    }
+}
+"""
+TYPEID_FILES = {**FILES, "app/src/main.rs": TYPEID_MAIN, "dep/src/lib.rs": TYPEID_DEP}
+TYPEID_SCENARIOS = {
+    "typeid-ctor": ([[edit(M, "    let first = 1;\n", "    let first = 2;\n")],
+                     [edit(M, "    let first = 2;\n", "    let first = 3;\n")]], ["full", "patch"], 0, {}),
+}
+SCENARIOS.update(TYPEID_SCENARIOS)
+
 # How the daemon's own base is to go before the first edit, in the scenarios that say.
 OWN_BASE = {"unbuilt-member": "built", "own-base-budget": "given up", "own-base-budget-full": "given up"}
 
@@ -609,6 +725,8 @@ def main():
             files = LIB_FILES
         elif name in SAME_NAME_SCENARIOS:
             files = SAME_NAME_FILES
+        elif name in TYPEID_SCENARIOS:
+            files = TYPEID_FILES
         elif name in STATICS_SCENARIOS:
             files = STATICS_FILES
         elif name in TLS_SCENARIOS:
