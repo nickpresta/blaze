@@ -244,9 +244,25 @@ impl LibrarySources {
 }
 
 /// Symbol names come from the rustc-built artifacts we link against.
+/// What rustc's copy of a static under a symbol LLVM gave it is to a copy of ours, when it
+/// is not simply the whole static: rustc keeps a static the code of one codegen unit uses to
+/// that unit, and LLVM renames it as it optimizes (`SERVING.0`, `SERVING.llvm.<hash>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RustcStaticCopy {
+    /// A part LLVM split off the static, which is the whole when it has this many bytes.
+    Sized(u64),
+    /// No copy of ours can be that one, for the reason given.
+    Unshared(String),
+}
+
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
     fn static_(&self, id: StaticId) -> Option<String>;
+    /// What rustc's copy under `symbol`, which [`Self::static_`] named, is to ours, when
+    /// that is not simply the whole static.
+    fn static_copy(&self, _symbol: &str) -> Option<RustcStaticCopy> {
+        None
+    }
     /// Whether rustc built the function under a symbol that only its own object can link to.
     fn private(&self, _func: FunctionId) -> bool {
         false
@@ -6500,10 +6516,38 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // first value the source gives it now: after an edit to that value, ours is the one
         // with the program's value. A patch keeps what its base chose, and declines an edit
         // to the first value of one the base shares (`Base::stale`).
-        let symbol = self.symbols.static_(id);
         let stateful = || {
             is_thread_local(db, id) || compiled_static(db, id).as_ref().is_ok_and(|it| it.writable)
         };
+        let mut symbol = self.symbols.static_(id);
+        // rustc's copy under a name LLVM gave it, or one private to its object, is shared
+        // only when it is the whole static and ours can link to it. When it can't be, a static
+        // with state is not ours to copy either: rustc's code that has it inlined (a function
+        // left to rustc, rustc's copy of an instance we could not compile, its allocator shim)
+        // reads and writes rustc's, and a copy of ours would split the program's state in two
+        // with nothing to tell (`docs/live.md#statics`). What refers to it is left to rustc.
+        if let Some(found) = symbol.as_deref()
+            && let Some(copy) = self.symbols.static_copy(found)
+        {
+            let size = || compiled_static(db, id).as_ref().ok().map(|it| it.blob.bytes.len());
+            let why = match copy {
+                RustcStaticCopy::Sized(whole) if size() == usize::try_from(whole).ok() => None,
+                RustcStaticCopy::Sized(part) => {
+                    Some(format!("is a part LLVM split off it, of {part} bytes"))
+                }
+                RustcStaticCopy::Unshared(why) => Some(why),
+            };
+            if let Some(why) = why {
+                if stateful() && self.symbols.linked(found) {
+                    let name = StaticSignature::of(db, id).name.as_str();
+                    unsupported!(
+                        "static `{name}` with state, whose copy in rustc's code (`{found}`) {why}: \
+                         a copy of ours would split the state"
+                    );
+                }
+                symbol = None;
+            }
+        }
         let in_base = self.base.and_then(|base| base.statics.get(&id));
         let stateful_linked = !self.symbols.nothing_of_rustc()
             && symbol.as_ref().is_some_and(|it| self.symbols.linked(it))

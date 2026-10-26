@@ -1550,6 +1550,10 @@ impl SymbolResolver for Resolver<'_> {
         self.table.is_empty().then(|| self.own_static_name(id)).flatten()
     }
 
+    fn static_copy(&self, symbol: &str) -> Option<hir_ty_codegen::RustcStaticCopy> {
+        self.table.static_copy(symbol).cloned()
+    }
+
     fn static_(&self, id: StaticId) -> Option<String> {
         if self.prebuilt(hir_def::HasModule::krate(&id, self.db)) {
             return self.in_prebuilt(self.own_static_name(id)?);

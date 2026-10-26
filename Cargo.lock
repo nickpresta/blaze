@@ -3326,6 +3326,7 @@ name = "ra-jit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ar_archive_writer",
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -3339,6 +3340,7 @@ dependencies = [
  "find-msvc-tools",
  "futures-util",
  "getrandom 0.3.4",
+ "gimli 0.33.0",
  "hir",
  "hir-def",
  "hir-ty",
