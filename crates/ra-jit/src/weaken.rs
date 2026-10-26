@@ -6,8 +6,10 @@
 //! such flag: two definitions of a name are an error unless one is weak, and of several weak
 //! ones the first on the command line stays. So every definition of the copies is made weak,
 //! and private to the program as well, which keeps the loader from looking for the name in
-//! the libraries it loads. Nothing else of a file changes, and a file that is no Mach-O
-//! object is copied as it is.
+//! the libraries it loads. rustc's copy of a static that is private to its object (rustc
+//! keeps a static to the codegen unit that uses it, and LLVM may rename it) is made private to
+//! the program instead, so that ra-jit's code can share it (`symbols::StaticCopy`). Nothing
+//! else of a file changes, and a file that is no Mach-O object is copied as it is.
 
 use std::{
     ops::Range,
@@ -21,12 +23,16 @@ use object::{
     pod,
     read::{
         archive::ArchiveFile,
-        macho::{MachHeader as _, Nlist as _},
+        macho::{MachHeader as _, Nlist as _, Segment as _},
     },
 };
 
-/// The directory of the copies, in the one the files are in.
-pub(crate) const DIR: &str = "ra-jit-weak";
+/// The directory of the copies, in the one the files are in. Named anew when the copies
+/// change, so that none of an older ra-jit is taken for one of this.
+pub(crate) const DIR: &str = "ra-jit-weak-2";
+
+/// The directories of copies older ra-jits wrote, which this one deletes.
+const OLD_DIRS: [&str; 1] = ["ra-jit-weak"];
 
 /// Writes the copy of each file and prints where it is, in the order given.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -42,6 +48,9 @@ pub(crate) fn copy_of(file: &Path) -> anyhow::Result<PathBuf> {
     let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
         anyhow::bail!("{} names no file", file.display());
     };
+    for old in OLD_DIRS {
+        _ = std::fs::remove_dir_all(dir.join(old));
+    }
     let dir = dir.join(DIR);
     std::fs::create_dir_all(&dir)?;
     let copy = dir.join(name);
@@ -88,9 +97,61 @@ enum Made {
     Private,
 }
 
-/// Makes the definitions of a Mach-O object weak; an object of another format stays as it is.
+/// Makes the definitions of a Mach-O object weak, and its statics private to the program;
+/// an object of another format stays as it is.
 pub(crate) fn definitions(data: &mut [u8]) {
     weaken_but(data, |_| Made::Private);
+    share_statics(data);
+}
+
+/// Makes each symbol of Rust's that is private to the object and names data the program
+/// writes (a section `symbols::CopyOfStatic` reads as such) a private external, which the
+/// code of another object can refer to: rustc's copy of a static it kept to its codegen unit,
+/// which ra-jit's code has to share. Its place in the table stays, among the local ones,
+/// which Apple's linker takes as it is, so no relocation's symbol changes; nor is it weak,
+/// so that two of one name are an error, not one.
+fn share_statics(data: &mut [u8]) {
+    let written = sections_written(data);
+    let Some((symbols, strings)) = symbol_table(data) else { return };
+    let (Some(names), Some(_)) = (data.get(strings.clone()), data.get(symbols.clone())) else {
+        return;
+    };
+    let names = names.to_vec();
+    let Ok(symbols) = pod::slice_from_all_bytes_mut::<Nlist64<LE>>(&mut data[symbols]) else {
+        return;
+    };
+    for symbol in symbols {
+        let defined = symbol.n_type & (N_STAB | N_TYPE) == N_SECT;
+        if !defined || symbol.n_type & N_EXT != 0 {
+            continue;
+        }
+        if !written.get(usize::from(symbol.n_sect).wrapping_sub(1)).is_some_and(|it| *it) {
+            continue;
+        }
+        let name = names.get(symbol.n_strx.get(LE) as usize..).unwrap_or_default();
+        let name = name.split(|&it| it == 0).next().unwrap_or_default();
+        let name = std::str::from_utf8(name).ok().and_then(|it| it.strip_prefix('_'));
+        if name.is_some_and(|it| crate::symbols::rust_symbol_length(it).is_some()) {
+            symbol.n_type |= N_EXT | N_PEXT;
+        }
+    }
+}
+
+/// Whether each section of a 64-bit Mach-O object, in the order symbols number them from 1,
+/// holds data a program writes to, as `symbols::written_at_run_time` tells it.
+fn sections_written(data: &[u8]) -> Vec<bool> {
+    let mut written = Vec::new();
+    let Ok(header) = MachHeader64::<LE>::parse(data, 0) else { return written };
+    let Ok(mut commands) = header.load_commands(LE, data, 0) else { return written };
+    while let Ok(Some(command)) = commands.next() {
+        let Ok(Some((segment, sections))) = command.segment_64() else { continue };
+        let Ok(sections) = segment.sections(LE, sections) else { return Vec::new() };
+        for section in sections {
+            let name = section.sectname.split(|&it| it == 0).next().unwrap_or_default();
+            written.push(matches!(name, b"__data" | b"__bss" | b"__common" | b"__thread_vars"));
+        }
+    }
+    written
 }
 
 /// As [`definitions`], for an object of ra-jit's. Of a program's whole, with a C `main` of
@@ -186,6 +247,7 @@ mod tests {
     use object::{
         Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
     };
+    use object::{Object as _, ObjectSymbol as _};
 
     use super::*;
 
@@ -245,5 +307,47 @@ mod tests {
         let mut data = object();
         definitions(&mut data);
         assert!(made(&data).iter().all(|&it| it == (private, weak)));
+    }
+
+    /// rustc's copies of statics it kept to their object, which LLVM may have renamed, become
+    /// linkable; the memory a static points to, a thread-local's first value, and what is
+    /// not written at run time stay as they are.
+    #[test]
+    fn a_static_private_to_rustcs_object_is_made_linkable() {
+        let mut object =
+            Object::new(BinaryFormat::MachO, Architecture::Aarch64, Endianness::Little);
+        object.set_mangling(Mangling::None);
+        let data = object.add_section(b"__DATA".to_vec(), b"__data".to_vec(), SectionKind::Data);
+        let constant =
+            object.add_section(b"__TEXT".to_vec(), b"__const".to_vec(), SectionKind::ReadOnlyData);
+        let symbols = [
+            ("__RNvCs1234_3app7SERVING.0", data, true),
+            ("__RNvCs1234_3app6ALLOCS", data, true),
+            ("__RNvCs1234_3app6ALLOCS.0.llvm.123", data, true),
+            ("__ZN3app6ALLOCS17h0123456789abcdefE.0", data, true),
+            ("__RNnCs1234_3app6ALLOCS", data, false),
+            ("__RNvCs1234_3app5TABLE", constant, false),
+            ("_counter", data, false),
+        ];
+        for (name, section, _) in symbols {
+            let value = object.append_section_data(section, &[0; 8], 8);
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value,
+                size: 8,
+                kind: SymbolKind::Data,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: SymbolFlags::None,
+            });
+        }
+        let mut data = object.write().unwrap();
+        definitions(&mut data);
+        let read = object::File::parse(&*data).unwrap();
+        for (name, _, linkable) in symbols {
+            let symbol = read.symbols().find(|it| it.name() == Ok(name)).unwrap();
+            assert_eq!(symbol.is_global(), linkable, "{name}");
+        }
     }
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Context;
-use object::{Object, ObjectSymbol, SymbolKind, read::archive::ArchiveFile};
+use object::{Object, ObjectSection as _, ObjectSymbol, SymbolKind, read::archive::ArchiveFile};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dep_info::DepInfo;
@@ -47,7 +47,22 @@ pub(crate) struct SymbolTable {
     makers: FxHashMap<String, FxHashSet<u64>>,
     /// Each file a crate starts at as [`SymbolTable::real`] names it.
     real: Mutex<FxHashMap<PathBuf, PathBuf>>,
+    /// rustc's copies of statics, by their symbols, that a copy of ours can only share with
+    /// a check or not at all ([`StaticCopy`]). One a symbol names whole is not here.
+    static_copies: FxHashMap<String, StaticCopy>,
+    /// How many copies of statics under names LLVM gave them or private to their objects
+    /// were read, shared or not.
+    copies_of_statics: usize,
 }
+
+/// What rustc's copy of a static is to code of ours that refers to the static, when LLVM gave
+/// it a name of its own or kept it to its object ([`hir_ty_codegen::RustcStaticCopy`]): rustc
+/// internalises a static only the code of one codegen unit uses, and LLVM then renames it as it
+/// optimizes (`SERVING` to `SERVING.0` when its global optimizer splits a struct into its
+/// fields, `.llvm.<hash>` when ThinLTO lets another unit use it). rustc's code reads and writes
+/// that copy, so a static with state has to be that one in ours too, or the program's state
+/// splits in two (`docs/live.md#statics`).
+pub(crate) use hir_ty_codegen::RustcStaticCopy as StaticCopy;
 
 struct NestedSymbol {
     name: String,
@@ -119,18 +134,38 @@ struct Named {
     private: bool,
     /// With the ids of the crates it names, and without them.
     demangled: Option<(String, String)>,
+    /// The symbol rustc gave a static that LLVM renamed, which `name` is rustc's copy of:
+    /// what the path and the places are read from.
+    base: Option<String>,
+    /// What that copy is to ours, when not simply the whole static.
+    copy: Option<StaticCopy>,
 }
 
 impl Named {
     fn new(name: &str, private: bool) -> Named {
-        // The memory a static points to is a symbol that demangles to the static's path.
-        let demangled = (!name.starts_with("_RNn"))
-            .then(|| rustc_demangle::try_demangle(name).ok())
-            .flatten()
-            // `{:#}` drops the crate disambiguator hashes.
-            .map(|it| (it.to_string(), format!("{it:#}")));
-        Named { name: name.to_owned(), private, demangled }
+        Named { name: name.to_owned(), private, demangled: demangled(name), base: None, copy: None }
     }
+
+    /// rustc's copy `name` of the static rustc named `base`.
+    fn static_copy(name: &str, base: &str, copy: Option<StaticCopy>) -> Named {
+        Named {
+            name: name.to_owned(),
+            private: false,
+            demangled: demangled(base),
+            base: Some(base.to_owned()),
+            copy,
+        }
+    }
+}
+
+/// How `name` demangles, with the ids of the crates it names and without them.
+fn demangled(name: &str) -> Option<(String, String)> {
+    // The memory a static points to is a symbol that demangles to the static's path.
+    (!name.starts_with("_RNn"))
+        .then(|| rustc_demangle::try_demangle(name).ok())
+        .flatten()
+        // `{:#}` drops the crate disambiguator hashes.
+        .map(|it| (it.to_string(), format!("{it:#}")))
 }
 
 /// What was read of a library before the table was asked for: with its length and when it
@@ -209,21 +244,32 @@ fn names_of(files: &[PathBuf]) -> Vec<anyhow::Result<Vec<Named>>> {
 fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let mut names = Vec::new();
+    // The objects of a program's crates are linked through copies that make their statics'
+    // symbols linkable (`weaken::copy_of`); the toolchain's prebuilt library is linked as it is.
+    let copied = !file.components().any(|it| it.as_os_str() == "rustlib");
     match ArchiveFile::parse(&*data) {
         Ok(archive) => {
             for member in archive.members() {
-                names_of_object(member?.data(&*data)?, &mut names);
+                names_of_object(member?.data(&*data)?, &mut names, copied);
             }
         }
-        Err(_) => names_of_object(&data, &mut names),
+        Err(_) => names_of_object(&data, &mut names, copied),
     }
     Ok(names)
 }
 
-fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
+/// The symbols of an object. `copied`: whether it is linked through a copy of
+/// [`crate::weaken::definitions`] (on Apple's linker), which makes the symbols of its statics
+/// that are private to it linkable.
+fn names_of_object(data: &[u8], names: &mut Vec<Named>, copied: bool) {
     // rlibs also hold `lib.rmeta`, which isn't an object file.
     let Ok(object) = object::File::parse(data) else { return };
+    let mut copies: FxHashMap<&str, Vec<CopyOfStatic<'_>>> = FxHashMap::default();
     for symbol in object.symbols() {
+        if let Some(copy) = CopyOfStatic::of(&object, &symbol) {
+            copies.entry(copy.base).or_default().push(copy);
+            continue;
+        }
         // A reference is as good as a definition: something in the link defines it.
         // Not `is_definition`, which leaves out thread locals.
         // A wasm object's data is in segments, which are not sections.
@@ -250,6 +296,203 @@ fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
         };
         names.push(Named::new(name, private));
     }
+    static_copies(&object, copies, copied, names);
+}
+
+/// A symbol of an object that may be rustc's copy of a static under a name LLVM gave it, or
+/// one private to the object: Rust's symbol of data a program writes to, with something after
+/// the symbol rustc gave it (`.0`, `.llvm.<hash>`), or local.
+struct CopyOfStatic<'data> {
+    /// Without Mach-O's `_`.
+    name: &'data str,
+    /// The symbol rustc gave the static.
+    base: &'data str,
+    local: bool,
+    address: u64,
+    size: u64,
+}
+
+impl<'data> CopyOfStatic<'data> {
+    fn of(
+        object: &object::File<'data>,
+        symbol: &object::Symbol<'data, '_>,
+    ) -> Option<CopyOfStatic<'data>> {
+        if !matches!(symbol.kind(), SymbolKind::Data | SymbolKind::Tls) {
+            return None;
+        }
+        let section = object.section_by_index(symbol.section_index()?).ok()?;
+        if !written_at_run_time(&section) {
+            return None;
+        }
+        let name = symbol.name().ok()?;
+        let name = match object.format() {
+            object::BinaryFormat::MachO => name.strip_prefix('_')?,
+            _ => name,
+        };
+        let base = &name[..rust_symbol_length(name)?];
+        let local = symbol.is_local();
+        (local || base.len() != name.len()).then_some(CopyOfStatic {
+            name,
+            base,
+            local,
+            address: symbol.address(),
+            size: symbol.size(),
+        })
+    }
+}
+
+/// Whether a section holds data a program writes to: a static with state is in one.
+fn written_at_run_time(section: &object::Section<'_, '_>) -> bool {
+    match section.flags() {
+        // `__thread_vars` holds the descriptor code refers to a thread-local by.
+        object::SectionFlags::MachO { .. } => {
+            matches!(section.name(), Ok("__data" | "__bss" | "__common" | "__thread_vars"))
+        }
+        object::SectionFlags::Elf { sh_flags } => {
+            sh_flags & u64::from(object::elf::SHF_WRITE) != 0
+                && !section.name().is_ok_and(|it| it.starts_with(".data.rel.ro"))
+        }
+        _ => false,
+    }
+}
+
+/// How long the symbol rustc made is at the start of `name`, a symbol LLVM may have put a
+/// suffix after (`.0`, `.llvm.<hash>`): `None` for no symbol of Rust's, or the memory a
+/// static points to (`_RNn`), or a thread-local's first value (`$tlv$init`).
+pub(crate) fn rust_symbol_length(name: &str) -> Option<usize> {
+    if name.contains('$') && !name.starts_with("_ZN") || name.starts_with("_RNn") {
+        return None;
+    }
+    if name.starts_with("_R") {
+        // v0 writes only letters, digits and `_`.
+        return Some(name.find('.').unwrap_or(name.len()));
+    }
+    // The legacy mangling: `_ZN`, names each after its length, `E`. A name may have `.` in
+    // it (`core..fmt..Debug`), and `$` escapes.
+    let mut rest = name.strip_prefix("_ZN")?.as_bytes();
+    let mut at = 3;
+    loop {
+        if rest.first() == Some(&b'E') {
+            return Some(at + 1);
+        }
+        let digits = rest.iter().take_while(|it| it.is_ascii_digit()).count();
+        let length: usize = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+        rest = rest.get(digits + length..)?;
+        at += digits + length;
+    }
+}
+
+/// What each copy of a static in `copies` is to ours, added to `names` under its own symbol.
+/// rustc gives a static one symbol, and LLVM gives what it makes of it names after that
+/// one: `<symbol>.llvm.<hash>` for the static under another name, `<symbol>.N` (and that
+/// with `.llvm.<hash>`) for the parts its global optimizer split it into, `<symbol>.b` for one
+/// it shrank to a `bool`. Only the static whole can be shared: a part that is the whole is
+/// told by the object's symbol (ELF) or its debug information (Mach-O).
+fn static_copies(
+    object: &object::File<'_>,
+    copies: FxHashMap<&str, Vec<CopyOfStatic<'_>>>,
+    copied: bool,
+    names: &mut Vec<Named>,
+) {
+    let macho = object.format() == object::BinaryFormat::MachO;
+    let mut decided = Vec::new();
+    let mut parts = FxHashMap::default();
+    for (base, mut found) in copies {
+        found.sort_by_key(|it| it.name);
+        let copy = &found[0];
+        let suffix = &copy.name[base.len()..];
+        let renamed = suffix.is_empty() || is_llvm_hash(suffix);
+        let part = suffix
+            .strip_prefix('.')
+            .map(|it| it.split_once(".llvm.").map_or(it, |(part, _)| part))
+            .is_some_and(|it| !it.is_empty() && it.bytes().all(|it| it.is_ascii_digit()));
+        let why = if found.len() > 1 {
+            Some(format!("is split by LLVM into {} parts", found.len()))
+        } else if copy.local && !(macho && copied) {
+            Some("is private to its object".to_owned())
+        } else if !renamed && !part {
+            Some(format!("was made something else by LLVM (`{suffix}`)"))
+        } else {
+            None
+        };
+        let copy_of = match why {
+            Some(why) => Some(StaticCopy::Unshared(why)),
+            None if renamed => None,
+            None if macho => {
+                parts.insert(base, copy.address);
+                None
+            }
+            None => Some(StaticCopy::Sized(copy.size)),
+        };
+        decided.push((copy.name, base, copy_of));
+    }
+    let whole =
+        if parts.is_empty() { FxHashSet::default() } else { whole_in_dwarf(object, &parts) };
+    for (name, base, mut copy) in decided {
+        if parts.contains_key(base) && !whole.contains(base) {
+            let why = "is a part LLVM split off, which the debug information does not say is whole";
+            copy = Some(StaticCopy::Unshared(why.to_owned()));
+        }
+        names.push(Named::static_copy(name, base, copy));
+    }
+}
+
+/// Whether `suffix` is the `.llvm.<hash>` ThinLTO gives a symbol it promotes.
+fn is_llvm_hash(suffix: &str) -> bool {
+    suffix
+        .strip_prefix(".llvm.")
+        .is_some_and(|it| !it.is_empty() && it.bytes().all(|it| it.is_ascii_digit()))
+}
+
+/// Of the statics `parts` names by rustc's symbol, with the address of a part LLVM split off,
+/// those the object's debug information says are at that address whole: a variable of that
+/// linkage name whose place is that address alone, with no `DW_OP_piece` of a part.
+fn whole_in_dwarf(object: &object::File<'_>, parts: &FxHashMap<&str, u64>) -> FxHashSet<String> {
+    let mut whole = FxHashSet::default();
+    let endian = match object.is_little_endian() {
+        true => gimli::RunTimeEndian::Little,
+        false => gimli::RunTimeEndian::Big,
+    };
+    let load = |id: gimli::SectionId| -> Result<_, gimli::Error> {
+        let data = object.section_by_name(id.name()).and_then(|it| it.data().ok());
+        Ok(gimli::EndianSlice::new(data.unwrap_or_default(), endian))
+    };
+    let Ok(dwarf) = gimli::Dwarf::load(load) else { return whole };
+    let mut units = dwarf.units();
+    while let Ok(Some(header)) = units.next() {
+        let Ok(unit) = dwarf.unit(header) else { continue };
+        let mut entries = unit.entries();
+        while let Ok(Some(entry)) = entries.next_dfs() {
+            if entry.tag() != gimli::DW_TAG_variable {
+                continue;
+            }
+            let linkage = entry
+                .attr_value(gimli::DW_AT_linkage_name)
+                .or_else(|| entry.attr_value(gimli::DW_AT_MIPS_linkage_name));
+            let Some(name) = linkage.and_then(|it| dwarf.attr_string(&unit, it).ok()) else {
+                continue;
+            };
+            let Ok(name) = name.to_string() else { continue };
+            let Some(&address) = parts.get(name) else { continue };
+            let Some(gimli::AttributeValue::Exprloc(place)) =
+                entry.attr_value(gimli::DW_AT_location)
+            else {
+                continue;
+            };
+            let mut operations = place.operations(unit.encoding());
+            let at = match operations.next() {
+                Ok(Some(gimli::Operation::Address { address })) => Some(address),
+                Ok(Some(gimli::Operation::AddressIndex { index })) => {
+                    dwarf.address(&unit, index).ok()
+                }
+                _ => None,
+            };
+            if at == Some(address) && matches!(operations.next(), Ok(None)) {
+                whole.insert(name.to_owned());
+            }
+        }
+    }
+    whole
 }
 
 pub(crate) fn hashed(symbol: &str) -> u64 {
@@ -626,6 +869,12 @@ impl SymbolTable {
                  indexed {indexed_in:.1?}",
                 files.len()
             );
+            let unshared = table.static_copies.values();
+            let unshared = unshared.filter(|it| matches!(it, StaticCopy::Unshared(_))).count();
+            eprintln!(
+                "symbols: {} copies of statics renamed or private, {} not to be shared",
+                table.copies_of_statics, unshared
+            );
         }
         Ok(table)
     }
@@ -690,6 +939,12 @@ impl SymbolTable {
         hashed(symbol)
     }
 
+    /// What rustc's copy of a static under `symbol` is to a copy of ours, when that is not
+    /// simply the whole static ([`StaticCopy`]).
+    pub(crate) fn static_copy(&self, symbol: &str) -> Option<&StaticCopy> {
+        self.static_copies.get(symbol)
+    }
+
     /// Whether the function at `path` is defined under a symbol private to its object.
     pub(crate) fn private(&self, path: &str) -> bool {
         self.private.contains(&Self::hashed(path))
@@ -700,7 +955,13 @@ impl SymbolTable {
     }
 
     fn add_name(&mut self, named: Named, symbols: &mut Vec<Symbol>) {
-        let Named { name, private, demangled } = named;
+        let Named { name, private, demangled, base, copy } = named;
+        self.copies_of_statics += usize::from(base.is_some());
+        if let Some(copy) = copy {
+            self.static_copies.insert(name.clone(), copy);
+        }
+        // A copy of a static LLVM renamed has the places of the symbol rustc gave it.
+        let parsed = base.as_deref().unwrap_or(&name);
         let instance = without_instantiating_crate(&name);
         if !private && self.names.insert(Self::hashed(&name)) && instance.len() != name.len() {
             self.copies.entry(instance.to_owned()).or_default().push(name.clone());
@@ -721,8 +982,8 @@ impl SymbolTable {
         {
             self.makers.entry(function).or_default().insert(maker);
         }
-        let place = V0::place(&name);
-        let around = V0::places_around(&name).unwrap_or_default();
+        let place = V0::place(parsed);
+        let around = V0::places_around(parsed).unwrap_or_default();
         symbols.push(Symbol { private, name, place, around, with_ids, path });
     }
 

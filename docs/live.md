@@ -83,13 +83,25 @@ reads as never set in ours, and a counter the allocator bumps reads zero. So:
   ours, as before. Not yet handled: one ours can't replace (`#[no_mangle]`, `#[export_name]`,
   or one a function left to rustc refers to) stays rustc's after an edit to its first value,
   in the full build too, with the old value, as any such static of rustc's does;
-- not yet handled: a stateful static that rustc made local to one codegen unit has no symbol
-  to import, so ours is a private copy (`ra_jit::static::N`). If one of its users ends up as
-  rustc's copy anyway (a failed instance forwarded to rustc's, or a caller left to rustc that
-  reaches a callee we never compiled), the two halves split. A program can avoid it by giving
-  such a static a name rustc always exports (`#[unsafe(no_mangle)]`, with `#[thread_local]`
-  for a thread-local); a general fix would make weaken.rs promote rustc's local static to a
-  private external symbol the daemon can import.
+- a static rustc keeps to the one codegen unit whose code uses it (rustc internalises it) has
+  no symbol of the name rustc gave it, and at opt-level 1 and up LLVM renames it as it
+  optimizes: its global optimizer splits a static of one field into that field (`SERVING` in
+  rgb's client became `SERVING.0`), and ThinLTO gives one another unit uses `.llvm.<hash>`. The
+  code rustc inlined it into is anywhere in the crate, so rustc's copy is the program's even
+  where every function that names it is ours. `symbols::StaticCopy` reads such copies from
+  rustc's objects (a symbol of Rust's in a section the program writes, local or with a suffix
+  after the name rustc gave it) and shares one where it is the whole static: under the name
+  LLVM gave it, or `.N` alone where the object says the part is the whole (an ELF symbol by its
+  size, a Mach-O one by its debug information's place for the variable: one address and no
+  `DW_OP_piece`). On Apple's linker the copies of rustc's objects (`weaken.rs`) make a symbol
+  of a static that is private to its object a private external, so that ours can link to it;
+  ELF has no such copy. A static with state whose copy can't be shared (one private to its
+  object on Linux, one LLVM split into several parts or into a `bool`, a part with no debug
+  information to tell it whole) is not copied either: the function that refers to it is left
+  to rustc, saying why (``static `X` with state, whose copy in rustc's code (`...`) ...``),
+  rather than split the state with nothing to tell. `harness/renamedstatics.py` checks both
+  forms. Not yet handled: what rustc's code reads of a static LLVM proved it never writes is
+  folded into that code, so an edit that adds a write to one is not seen by it.
 
 ## What is refused
 
