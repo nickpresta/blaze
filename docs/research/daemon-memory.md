@@ -485,6 +485,19 @@ GB against 16.2, `background_thread:true` 15.9).
   (`RA_JIT_LRU`, [cargo.md](../cargo.md)): 2,048 lowered and runtime bodies each, 16,384
   instances' code, 8,192 bodies to inline. Values past that are let go when the build is over
   (`let_go`), and jemalloc is asked to purge (`memory::give_back`).
+- Nothing is let go while a program's own base is still to come (wanted, not built and not
+  given up): an edit interrupts the base, and the base built again after it takes what it had
+  computed; let go, it would compute it all again and, with edits more often than it takes,
+  never be done. Only a worker that serves sets the `lru`s, whose bookkeeping (a lock per
+  fetch) is a cost of every fetch of those queries; it is the likely cause of the own base's 70
+  → 73-74 s below (**unverified**: not profiled).
+- `compiled_root`, the code of each non-generic function under its own symbol, has no `lru`:
+  a patch reads it for every function of the program it links (**unverified** as a cost).
+- `vendor/salsa/tests/lru_cycle.rs` keeps the patch's case: a memo evicted, verified again by
+  what depends on it, then asked for. It fails without the patch (`Cancelled::PropagatedPanic`)
+  and passes with it (**read**). `vendor/salsa` is no member of the workspace, so CI does not
+  run it: copy the directory out, add `[workspace]` to its `Cargo.toml`, and run `cargo test
+  --test lru_cycle --features inventory` there.
 - `infer` was tried with an `lru` too (a free tracked function in place of the method): the
   first edit after the own base took 11-12 s against 3.4 s, and the worker held the same, so
   it is not in.

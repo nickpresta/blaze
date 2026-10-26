@@ -2300,7 +2300,6 @@ fn load(
         scripts_said,
     };
     let mut db = RootDatabase::new(None);
-    memo_capacities(&mut db);
     let mut vfs = vfs::Vfs::default();
     checkouts.add(projects, &mut db, &mut vfs)?;
     Ok((db, vfs, checkouts))
@@ -6427,9 +6426,13 @@ impl Drop for Tiering {
 /// Lets go now of what the queries with an `lru` keep past it, the trees parsed and the bodies
 /// lowered for the builds that are over, which would otherwise wait for the next edit. Only
 /// when nothing else holds the database: this cancels what does.
-fn let_go(db: &mut RootDatabase, builds: &Builds) {
+fn let_go(db: &mut RootDatabase, builds: &Builds, programs: &[Program]) {
     use ide_db::base_db::salsa::Database;
-    if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 {
+    // An own base an edit interrupted is built again from what it had computed, which letting
+    // it go would have it compute again (#261): only once it is built, or given up.
+    let base_to_come = (programs.iter().enumerate())
+        .any(|(at, it)| !builds.given_up.contains(&at) && it.known.wants_base());
+    if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 && !base_to_come {
         db.trigger_lru_eviction();
         // An idle worker allocates nothing, and jemalloc returns freed pages only as it
         // allocates, so what the build and the eviction freed would stay resident.
@@ -6444,9 +6447,13 @@ fn let_go(db: &mut RootDatabase, builds: &Builds) {
 /// 13 GB live (#261). One let go is computed again if an edit asks for it, which only the
 /// first edit after a build in full does much of. `RA_JIT_LRU` (`mir=N,runtime=N,compiled=N,
 /// inlinable=N`) sets any of them; 0 keeps every value.
-fn memo_capacities(db: &mut RootDatabase) {
+fn memo_capacities(db: &mut RootDatabase) -> anyhow::Result<()> {
     let (mut mir, mut runtime, mut compiled, mut inlinable) = (2048, 2048, 16384, 8192);
-    let said = std::env::var("RA_JIT_LRU").unwrap_or_default();
+    let said = match std::env::var("RA_JIT_LRU") {
+        Ok(said) => said,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(why) => bail!("RA_JIT_LRU: {why}"),
+    };
     for it in said.split(',').filter(|it| !it.trim().is_empty()) {
         let parsed =
             it.split_once('=').and_then(|(name, n)| Some((name.trim(), n.trim().parse().ok()?)));
@@ -6455,7 +6462,7 @@ fn memo_capacities(db: &mut RootDatabase) {
             Some(("runtime", n)) => runtime = n,
             Some(("compiled", n)) => compiled = n,
             Some(("inlinable", n)) => inlinable = n,
-            _ => eprintln!(
+            _ => bail!(
                 "RA_JIT_LRU: `{it}` is not one of mir, runtime, compiled or inlinable = a number"
             ),
         }
@@ -6463,6 +6470,7 @@ fn memo_capacities(db: &mut RootDatabase) {
     hir_ty::mir::set_mir_capacity(db, mir);
     hir_ty::mir::set_runtime_mir_capacity(db, runtime);
     hir_ty_codegen::set_code_capacity(db, compiled, inlinable);
+    Ok(())
 }
 
 impl std::io::Write for &Client {
@@ -8131,6 +8139,11 @@ fn run_holding(
         use ide_db::base_db::salsa::{Database, Durability};
         db.synthetic_write(Durability::LOW);
     }
+    // Only a worker that serves builds again and lets go after; the bookkeeping of an `lru`
+    // costs every fetch of its queries.
+    if listener.is_some() {
+        memo_capacities(&mut db)?;
+    }
     memory::report(&mut db, "warm-up")?;
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
@@ -8272,7 +8285,7 @@ fn run_holding(
                     Some(at) if idle => match builds.events.recv_timeout(OWN_BASE_AFTER) {
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
-                                let_go(&mut db, &builds);
+                                let_go(&mut db, &builds, &programs);
                                 memory::served(&mut db)?;
                             }
                         }
@@ -8284,7 +8297,7 @@ fn run_holding(
                     _ if builds.stuck || idle => {
                         let event = builds.events.recv()?;
                         if builds.take(event, &mut programs)? {
-                            let_go(&mut db, &builds);
+                            let_go(&mut db, &builds, &programs);
                             memory::served(&mut db)?;
                         }
                     }
@@ -8298,7 +8311,7 @@ fn run_holding(
                     // requests sent with its own to arrive.
                     while let Ok(event) = builds.events.try_recv() {
                         if builds.take(event, &mut programs)? {
-                            let_go(&mut db, &builds);
+                            let_go(&mut db, &builds, &programs);
                             memory::served(&mut db)?;
                         }
                     }
@@ -9291,7 +9304,7 @@ fn run_holding(
             });
             links.insert(out, linked);
         }
-        let_go(&mut db, &builds);
+        let_go(&mut db, &builds, &programs);
         memory::served(&mut db)?;
     }
 }
