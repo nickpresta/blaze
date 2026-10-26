@@ -191,7 +191,10 @@ fn share_elf(data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         let bytes = member.data(data)?;
         let shared = share_elf_object(bytes)?;
         any |= shared.is_some();
-        members.push((name, shared.map_or(std::borrow::Cow::Borrowed(bytes), std::borrow::Cow::Owned)));
+        members.push((
+            name,
+            shared.map_or(std::borrow::Cow::Borrowed(bytes), std::borrow::Cow::Owned),
+        ));
     }
     if !any {
         return Ok(None);
@@ -346,9 +349,7 @@ fn promote_statics(data: &mut [u8]) -> anyhow::Result<bool> {
         new_index[index] = u32::try_from(*place)?;
         *place += 1;
     }
-    let renumber = |index: u32| -> u32 {
-        new_index.get(index as usize).copied().unwrap_or(index)
-    };
+    let renumber = |index: u32| -> u32 { new_index.get(index as usize).copied().unwrap_or(index) };
     let table_bytes = data[symtab.offset..symtab.offset + locals * SYM].to_vec();
     for (index, promote) in promoted.iter().enumerate() {
         let to = symtab.offset + new_index[index] as usize * SYM;
@@ -618,7 +619,9 @@ mod tests {
     /// it; the memory a static points to, and what is not Rust's, stay as they are.
     #[test]
     fn a_static_private_to_rustcs_elf_object_is_made_a_hidden_global() {
-        use object::{ObjectComdat as _, ObjectSection as _, RelocationTarget, SymbolFlags as Flags, elf};
+        use object::{
+            ObjectComdat as _, ObjectSection as _, RelocationTarget, SymbolFlags as Flags, elf,
+        };
         let mut object = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
         let data = object.section_id(object::write::StandardSection::Data);
         let constant = object.section_id(object::write::StandardSection::ReadOnlyData);
@@ -740,7 +743,10 @@ mod tests {
             .collect();
         assert_eq!(targets, [symbols[0].0, symbols[2].0]);
         let group = read.comdats().next().unwrap();
-        assert_eq!(read.symbol_by_index(group.symbol()).unwrap().name(), Ok("_RNvCs1234_3app7grouped"));
+        assert_eq!(
+            read.symbol_by_index(group.symbol()).unwrap().name(),
+            Ok("_RNvCs1234_3app7grouped")
+        );
         // A file with nothing left to share is linked as it is.
         assert!(share_elf(members[1].data(&*shared).unwrap()).unwrap().is_none());
     }
