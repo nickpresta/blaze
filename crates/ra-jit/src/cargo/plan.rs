@@ -353,15 +353,19 @@ impl LinkLine {
     }
 
     /// Has what rustc built of the workspace give way to the daemon's by being weak, where
-    /// the linker has no flag for the first definition staying: Apple's.
+    /// the linker has no flag for the first definition staying: Apple's. Either way the
+    /// statics rustc kept private to an object are made ones the daemon's code can refer to
+    /// (`symbols::StaticCopy`): on an ELF system in copies of the files that have any.
     fn give_way(&mut self, copies: &[PathBuf]) -> anyhow::Result<()> {
-        if self.flavor != Flavor::Apple {
-            return Ok(());
-        }
+        let made = match self.flavor {
+            Flavor::Apple => weaken::copy_of,
+            Flavor::Cc => weaken::shared,
+            Flavor::Msvc => return Ok(()),
+        };
         for arg in &mut self.args {
             // rustc's object of names defines none.
             if !is_symbols(arg) && copies.iter().any(|it| it == Path::new(arg)) {
-                *arg = weaken::copy_of(Path::new(arg))?.display().to_string();
+                *arg = made(Path::new(arg))?.display().to_string();
             }
         }
         Ok(())

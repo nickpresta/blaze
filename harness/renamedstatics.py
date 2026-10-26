@@ -18,10 +18,9 @@ ever set, so the program printed `false` (the space game's `eye_state::SERVING`,
 `eye.*` reading went empty under blaze).
 
 The daemon has to share rustc's copy: under its own name where the object says it is the whole
-static, made linkable on macOS where it was private to the object. Where it can't (a symbol
-private to its object on Linux), it leaves the code that refers to the static to rustc, so the
-program still prints `true`, and the build need not be the daemon's. The harness first checks
-that the program has the renamed symbol, so that it tests what it is about.
+static, in a copy of rustc's object that makes it linkable where it was private to the object
+(macOS and Linux both). The harness first checks that the program has the renamed symbol, so
+that it tests what it is about.
 
 Python 3, stdlib only.
 """
@@ -116,9 +115,6 @@ def main():
     for name in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     env["CARGO_INCREMENTAL"] = "1" if incremental else "0"
-    # Where rustc's symbol is private to its object, Linux has no copy of it to link to: the
-    # code that refers to it is rustc's, and the build may be cargo's.
-    served = incremental or sys.platform == "darwin"
     program, source = os.path.join(ws, "target", "debug", "rapp"), os.path.join(ws, "app", "src", "main.rs")
     wrong = 0
     try:
@@ -142,7 +138,7 @@ def main():
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
-            elif served and "[ra-jit]" not in said:
+            elif "[ra-jit]" not in said:
                 why = [line for line in said.splitlines() if "ra-jit" in line]
                 verdict = "NOT SERVED BY THE DAEMON: " + " | ".join(why)[-600:]
             wrong += verdict != "ok"

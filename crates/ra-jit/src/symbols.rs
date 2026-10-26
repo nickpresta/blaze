@@ -245,7 +245,8 @@ fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let mut names = Vec::new();
     // The objects of a program's crates are linked through copies that make their statics'
-    // symbols linkable (`weaken::copy_of`); the toolchain's prebuilt library is linked as it is.
+    // symbols linkable (`weaken::copy_of` on Apple's systems, `weaken::shared` on ELF ones);
+    // the toolchain's prebuilt library is linked as it is.
     let copied = !file.components().any(|it| it.as_os_str() == "rustlib");
     match ArchiveFile::parse(&*data) {
         Ok(archive) => {
@@ -259,8 +260,8 @@ fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
 }
 
 /// The symbols of an object. `copied`: whether it is linked through a copy of
-/// [`crate::weaken::definitions`] (on Apple's linker), which makes the symbols of its statics
-/// that are private to it linkable.
+/// [`crate::weaken::definitions`] (on Apple's linker) or [`crate::weaken::shared`] (on an ELF
+/// one), which make the symbols of its statics that are private to it linkable.
 fn names_of_object(data: &[u8], names: &mut Vec<Named>, copied: bool) {
     // rlibs also hold `lib.rmeta`, which isn't an object file.
     let Ok(object) = object::File::parse(data) else { return };
@@ -342,7 +343,7 @@ impl<'data> CopyOfStatic<'data> {
 }
 
 /// Whether a section holds data a program writes to: a static with state is in one.
-fn written_at_run_time(section: &object::Section<'_, '_>) -> bool {
+pub(crate) fn written_at_run_time(section: &object::Section<'_, '_>) -> bool {
     match section.flags() {
         // `__thread_vars` holds the descriptor code refers to a thread-local by.
         object::SectionFlags::MachO { .. } => {
@@ -395,6 +396,9 @@ fn static_copies(
     names: &mut Vec<Named>,
 ) {
     let macho = object.format() == object::BinaryFormat::MachO;
+    // The copies the daemon links make a symbol private to its object linkable: Apple's
+    // (`weaken::definitions`) and ELF's (`weaken::shared`).
+    let shares_private = macho || object.format() == object::BinaryFormat::Elf;
     let mut decided = Vec::new();
     let mut parts = FxHashMap::default();
     for (base, mut found) in copies {
@@ -408,7 +412,7 @@ fn static_copies(
             .is_some_and(|it| !it.is_empty() && it.bytes().all(|it| it.is_ascii_digit()));
         let why = if found.len() > 1 {
             Some(format!("is split by LLVM into {} parts", found.len()))
-        } else if copy.local && !(macho && copied) {
+        } else if copy.local && !(copied && shares_private) {
             Some("is private to its object".to_owned())
         } else if !renamed && !part {
             Some(format!("was made something else by LLVM (`{suffix}`)"))
@@ -1659,7 +1663,7 @@ mod tests {
             });
         }
         let mut names = Vec::new();
-        names_of_object(&object.write().unwrap(), &mut names);
+        names_of_object(&object.write().unwrap(), &mut names, true);
         let names: Vec<&str> = names.iter().map(|it| it.name.as_str()).collect();
         assert_eq!(names, [name]);
     }

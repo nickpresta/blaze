@@ -137,6 +137,134 @@ fn share_statics(data: &mut [u8]) {
     }
 }
 
+/// rustc's file as the daemon links it on an ELF system: a copy of it in which every symbol
+/// of Rust's that is private to its object and names data the program writes is a hidden
+/// global instead, or `file` itself when it has none. An ELF linker keeps the first
+/// definition of a name, so nothing else of rustc's has to give way to the daemon's; but its
+/// copy of a static that rustc kept to the codegen unit that uses it (and LLVM may have
+/// renamed) is one the daemon's code has to share (`symbols::StaticCopy`), and a symbol
+/// private to an object is one no other object can refer to. Hidden, the name stays the
+/// program's own; global, two definitions of one name are the linker's first-stays rule, as
+/// for every other name of rustc's, of which a static has one.
+pub(crate) fn shared(file: &Path) -> anyhow::Result<PathBuf> {
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
+        anyhow::bail!("{} names no file", file.display());
+    };
+    let dir = dir.join(DIR);
+    let copy = dir.join(name);
+    // That the file has nothing to share, written so that the next link need not look again.
+    let mut as_is = name.to_owned();
+    as_is.push(".as-is");
+    let as_is = dir.join(as_is);
+    if up_to_date(&copy, file) {
+        return Ok(copy);
+    }
+    if up_to_date(&as_is, file) {
+        return Ok(file.to_owned());
+    }
+    let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    std::fs::create_dir_all(&dir)?;
+    match share_elf(&data).with_context(|| format!("sharing the statics of {}", file.display()))? {
+        Some(shared) => {
+            _ = std::fs::remove_file(&as_is);
+            crate::replace(&copy, &shared)?;
+            Ok(copy)
+        }
+        None => {
+            _ = std::fs::remove_file(&copy);
+            crate::replace(&as_is, b"")?;
+            Ok(file.to_owned())
+        }
+    }
+}
+
+/// [`shared`]'s copy of an ELF object or of an archive of them, when there is one to make.
+/// An archive is written again whole, with its index of names, the members it had in the
+/// order they were in.
+fn share_elf(data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let Ok(archive) = ArchiveFile::parse(data) else { return share_elf_object(data) };
+    let mut members = Vec::new();
+    let mut any = false;
+    for member in archive.members() {
+        let member = member?;
+        let name = String::from_utf8_lossy(member.name()).into_owned();
+        let bytes = member.data(data)?;
+        let shared = share_elf_object(bytes)?;
+        any |= shared.is_some();
+        members.push((name, shared.map_or(std::borrow::Cow::Borrowed(bytes), std::borrow::Cow::Owned)));
+    }
+    if !any {
+        return Ok(None);
+    }
+    let members: Vec<ar_archive_writer::NewArchiveMember<'_>> = members
+        .iter()
+        .map(|(name, bytes)| {
+            ar_archive_writer::NewArchiveMember::new(
+                &**bytes,
+                &ar_archive_writer::DEFAULT_OBJECT_READER,
+                name.clone(),
+            )
+        })
+        .collect();
+    let mut out = std::io::Cursor::new(Vec::new());
+    ar_archive_writer::write_archive_to_stream(
+        &mut out,
+        &members,
+        ar_archive_writer::ArchiveKind::Gnu,
+        false,
+        None,
+    )?;
+    Ok(Some(out.into_inner()))
+}
+
+/// [`shared`]'s copy of one ELF object, when it has a static to share; anything else (rustc's
+/// metadata, another format) has none.
+fn share_elf_object(data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    use object::{Object as _, ObjectSymbol as _, elf};
+    if !data.starts_with(&elf::ELFMAG) {
+        return Ok(None);
+    }
+    let shareable = |name: &[u8], written: bool| {
+        written
+            && std::str::from_utf8(name)
+                .is_ok_and(|it| crate::symbols::rust_symbol_length(it).is_some())
+    };
+    // A look first: reading the whole object to write it again costs more.
+    let file = object::File::parse(data)?;
+    let any = file.symbols().any(|symbol| {
+        let data = matches!(symbol.kind(), object::SymbolKind::Data | object::SymbolKind::Tls);
+        let section = symbol.section_index().and_then(|it| file.section_by_index(it).ok());
+        data && symbol.is_local()
+            && section.is_some_and(|section| {
+                shareable(
+                    symbol.name_bytes().unwrap_or_default(),
+                    crate::symbols::written_at_run_time(&section),
+                )
+            })
+    });
+    if !any {
+        return Ok(None);
+    }
+    let mut builder = object::build::elf::Builder::read(data)?;
+    let sections = &builder.sections;
+    for symbol in builder.symbols.iter_mut() {
+        let (bind, kind) = (symbol.st_info >> 4, symbol.st_info & 0xf);
+        if bind != elf::STB_LOCAL || !matches!(kind, elf::STT_OBJECT | elf::STT_TLS) {
+            continue;
+        }
+        let Some(section) = symbol.section.map(|it| sections.get(it)) else { continue };
+        let written = section.sh_flags & u64::from(elf::SHF_WRITE) != 0
+            && !section.name.starts_with(b".data.rel.ro");
+        if shareable(&symbol.name, written) {
+            symbol.st_info = (elf::STB_GLOBAL << 4) | kind;
+            symbol.st_other = (symbol.st_other & !3) | elf::STV_HIDDEN;
+        }
+    }
+    let mut out = Vec::new();
+    builder.write(&mut out)?;
+    Ok(Some(out))
+}
+
 /// Whether each section of a 64-bit Mach-O object, in the order symbols number them from 1,
 /// holds data a program writes to, as `symbols::written_at_run_time` tells it.
 fn sections_written(data: &[u8]) -> Vec<bool> {
@@ -349,5 +477,99 @@ mod tests {
             let symbol = read.symbols().find(|it| it.name() == Ok(name)).unwrap();
             assert_eq!(symbol.is_global(), linkable, "{name}");
         }
+    }
+
+    /// On ELF, rustc's copy of a static private to its object is a hidden global in the copy
+    /// of an rlib, which keeps its members in their order, and a relocation to it still names
+    /// it; the memory a static points to, and what is not Rust's, stay as they are.
+    #[test]
+    fn a_static_private_to_rustcs_elf_object_is_made_a_hidden_global() {
+        use object::{ObjectSection as _, RelocationTarget, SymbolFlags as Flags, elf};
+        let mut object = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let data = object.section_id(object::write::StandardSection::Data);
+        let constant = object.section_id(object::write::StandardSection::ReadOnlyData);
+        let text = object.section_id(object::write::StandardSection::Text);
+        let symbols = [
+            ("_RNvCs1234_3app7SERVING.0", data, true),
+            ("_ZN3app6ALLOCS17h0123456789abcdefE.llvm.123", data, true),
+            ("_RNvCs1234_3app5TABLE", constant, false),
+            ("counter", data, false),
+        ];
+        let mut ids = Vec::new();
+        for (name, section, _) in symbols {
+            let value = object.append_section_data(section, &[0; 8], 8);
+            ids.push(object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value,
+                size: 8,
+                kind: SymbolKind::Data,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: SymbolFlags::None,
+            }));
+        }
+        let at = object.append_section_data(text, &[0x90; 16], 16);
+        object.add_symbol(Symbol {
+            name: b"_RNvCs1234_3app7serving".to_vec(),
+            value: at,
+            size: 16,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                text,
+                object::write::Relocation {
+                    offset: at + 4,
+                    symbol: ids[0],
+                    addend: -4,
+                    flags: object::RelocationFlags::Elf { r_type: elf::R_X86_64_PC32 },
+                },
+            )
+            .unwrap();
+        let object = object.write().unwrap();
+        let members = [("lib.rmeta", &b"rust metadata"[..]), ("app.app.1-cgu.0.rcgu.o", &object)];
+        let members: Vec<_> = members
+            .iter()
+            .map(|(name, bytes)| {
+                ar_archive_writer::NewArchiveMember::new(
+                    *bytes,
+                    &ar_archive_writer::DEFAULT_OBJECT_READER,
+                    (*name).to_owned(),
+                )
+            })
+            .collect();
+        let mut rlib = std::io::Cursor::new(Vec::new());
+        ar_archive_writer::write_archive_to_stream(
+            &mut rlib,
+            &members,
+            ar_archive_writer::ArchiveKind::Gnu,
+            false,
+            None,
+        )
+        .unwrap();
+        let shared = share_elf(&rlib.into_inner()).unwrap().unwrap();
+        let archive = ArchiveFile::parse(&*shared).unwrap();
+        let members: Vec<_> = archive.members().map(Result::unwrap).collect();
+        let names: Vec<_> = members.iter().map(|it| it.name()).collect();
+        assert_eq!(names, [&b"lib.rmeta"[..], b"app.app.1-cgu.0.rcgu.o"]);
+        assert_eq!(members[0].data(&*shared).unwrap(), b"rust metadata");
+        let read = object::File::parse(members[1].data(&*shared).unwrap()).unwrap();
+        for (name, _, shared) in symbols {
+            let symbol = read.symbols().find(|it| it.name() == Ok(name)).unwrap();
+            assert_eq!(symbol.is_global(), shared, "{name}");
+            let Flags::Elf { st_other, .. } = symbol.flags() else { panic!("{name}") };
+            assert_eq!(st_other & 3 == elf::STV_HIDDEN, shared, "{name}");
+        }
+        let text = read.section_by_name(".text").unwrap();
+        let (_, relocation) = text.relocations().next().unwrap();
+        let RelocationTarget::Symbol(target) = relocation.target() else { panic!() };
+        assert_eq!(read.symbol_by_index(target).unwrap().name(), Ok(symbols[0].0));
+        // A file with nothing left to share is linked as it is.
+        assert!(share_elf(members[1].data(&*shared).unwrap()).unwrap().is_none());
     }
 }

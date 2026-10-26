@@ -3432,6 +3432,7 @@ name = "ra-jit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ar_archive_writer",
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
