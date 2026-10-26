@@ -218,51 +218,185 @@ fn share_elf(data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
 }
 
 /// [`shared`]'s copy of one ELF object, when it has a static to share; anything else (rustc's
-/// metadata, another format) has none.
+/// metadata, another format) has none. A 64-bit little-endian object is changed in place, as
+/// object's ELF builder takes no section groups, which rustc's objects have: the symbols made
+/// global move to the end of the local ones, which leaves the global ones where they were, and
+/// what numbers a local symbol (relocations, a group's signature, the table of extended section
+/// indices) is numbered again. LLVM's tables of which symbols' addresses matter and of the call
+/// graph's weights are made ones the linker drops (they are `SHF_EXCLUDE`): without the first,
+/// every symbol's address matters, which is the safe side.
 fn share_elf_object(data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-    use object::{Object as _, ObjectSymbol as _, elf};
-    if !data.starts_with(&elf::ELFMAG) {
+    use object::elf;
+    if !data.starts_with(&elf::ELFMAG)
+        || data.get(4) != Some(&elf::ELFCLASS64)
+        || data.get(5) != Some(&elf::ELFDATA2LSB)
+    {
         return Ok(None);
     }
-    let shareable = |name: &[u8], written: bool| {
-        written
-            && std::str::from_utf8(name)
-                .is_ok_and(|it| crate::symbols::rust_symbol_length(it).is_some())
+    let mut data = data.to_vec();
+    Ok(promote_statics(&mut data)?.then_some(data))
+}
+
+/// LLVM's section type for the table of symbols whose addresses matter (`.llvm_addrsig`).
+const SHT_LLVM_ADDRSIG: u32 = 0x6fff_4c03;
+
+/// One section header of a 64-bit object, as [`promote_statics`] reads it.
+#[derive(Clone, Copy)]
+struct Header {
+    at: usize,
+    kind: u32,
+    flags: u64,
+    offset: usize,
+    size: usize,
+    link: u32,
+    info: u32,
+    name: u32,
+}
+
+/// Makes the statics of [`share_elf_object`] hidden globals in `data`, a 64-bit
+/// little-endian ELF object, and says whether there were any.
+fn promote_statics(data: &mut [u8]) -> anyhow::Result<bool> {
+    use object::elf;
+    let u16_at = |data: &[u8], at: usize| -> anyhow::Result<u16> {
+        Ok(u16::from_le_bytes(data.get(at..at + 2).context("truncated")?.try_into()?))
     };
-    // A look first: reading the whole object to write it again costs more.
-    let file = object::File::parse(data)?;
-    let any = file.symbols().any(|symbol| {
-        let data = matches!(symbol.kind(), object::SymbolKind::Data | object::SymbolKind::Tls);
-        let section = symbol.section_index().and_then(|it| file.section_by_index(it).ok());
-        data && symbol.is_local()
-            && section.is_some_and(|section| {
-                shareable(
-                    symbol.name_bytes().unwrap_or_default(),
-                    crate::symbols::written_at_run_time(&section),
-                )
-            })
-    });
-    if !any {
-        return Ok(None);
+    let u32_at = |data: &[u8], at: usize| -> anyhow::Result<u32> {
+        Ok(u32::from_le_bytes(data.get(at..at + 4).context("truncated")?.try_into()?))
+    };
+    let u64_at = |data: &[u8], at: usize| -> anyhow::Result<u64> {
+        Ok(u64::from_le_bytes(data.get(at..at + 8).context("truncated")?.try_into()?))
+    };
+    let (shoff, shentsize) = (u64_at(data, 0x28)? as usize, usize::from(u16_at(data, 0x3a)?));
+    let (mut shnum, mut shstrndx) =
+        (usize::from(u16_at(data, 0x3c)?), usize::from(u16_at(data, 0x3e)?));
+    if shoff == 0 || shentsize < 64 {
+        return Ok(false);
     }
-    let mut builder = object::build::elf::Builder::read(data)?;
-    let sections = &builder.sections;
-    for symbol in builder.symbols.iter_mut() {
-        let (bind, kind) = (symbol.st_info >> 4, symbol.st_info & 0xf);
+    // More sections than the header can count put the count in the first one's size, and
+    // the index of the names' section in its link.
+    if shnum == 0 {
+        shnum = u64_at(data, shoff + 0x20)? as usize;
+    }
+    if shstrndx == usize::from(elf::SHN_XINDEX) {
+        shstrndx = u32_at(data, shoff + 0x28)? as usize;
+    }
+    let mut headers = Vec::with_capacity(shnum);
+    for index in 0..shnum {
+        let at = shoff + index * shentsize;
+        headers.push(Header {
+            at,
+            name: u32_at(data, at)?,
+            kind: u32_at(data, at + 4)?,
+            flags: u64_at(data, at + 8)?,
+            offset: u64_at(data, at + 0x18)? as usize,
+            size: u64_at(data, at + 0x20)? as usize,
+            link: u32_at(data, at + 0x28)?,
+            info: u32_at(data, at + 0x2c)?,
+        });
+    }
+    let names = headers.get(shstrndx).context("no section of section names")?;
+    let names = data.get(names.offset..names.offset + names.size).context("truncated")?.to_vec();
+    let name_of = |header: &Header| {
+        let name = names.get(header.name as usize..).unwrap_or_default();
+        name.split(|&it| it == 0).next().unwrap_or_default().to_vec()
+    };
+    let Some(table) = headers.iter().position(|it| it.kind == elf::SHT_SYMTAB) else {
+        return Ok(false);
+    };
+    let symtab = headers[table];
+    let strings = *headers.get(symtab.link as usize).context("no names of symbols")?;
+    let locals = symtab.info as usize;
+    const SYM: usize = 24;
+    let count = symtab.size / SYM;
+    if locals > count {
+        anyhow::bail!("{locals} local symbols of {count}");
+    }
+    // Which local symbols to make global.
+    let mut promoted = vec![false; locals];
+    for (index, promote) in promoted.iter_mut().enumerate().skip(1) {
+        let at = symtab.offset + index * SYM;
+        let (info, shndx) = (*data.get(at + 4).context("truncated")?, u16_at(data, at + 6)?);
+        let (bind, kind) = (info >> 4, info & 0xf);
         if bind != elf::STB_LOCAL || !matches!(kind, elf::STT_OBJECT | elf::STT_TLS) {
             continue;
         }
-        let Some(section) = symbol.section.map(|it| sections.get(it)) else { continue };
-        let written = section.sh_flags & u64::from(elf::SHF_WRITE) != 0
-            && !section.name.starts_with(b".data.rel.ro");
-        if shareable(&symbol.name, written) {
-            symbol.st_info = (elf::STB_GLOBAL << 4) | kind;
-            symbol.st_other = (symbol.st_other & !3) | elf::STV_HIDDEN;
+        if shndx == elf::SHN_UNDEF || shndx >= elf::SHN_LORESERVE {
+            continue;
+        }
+        let Some(section) = headers.get(usize::from(shndx)) else { continue };
+        let written = section.flags & u64::from(elf::SHF_WRITE) != 0
+            && !name_of(section).starts_with(b".data.rel.ro");
+        let name_at = strings.offset + u32_at(data, at)? as usize;
+        let name = data.get(name_at..strings.offset + strings.size).unwrap_or_default();
+        let name = name.split(|&it| it == 0).next().unwrap_or_default();
+        *promote = written
+            && std::str::from_utf8(name)
+                .is_ok_and(|it| crate::symbols::rust_symbol_length(it).is_some());
+    }
+    let moved = promoted.iter().filter(|it| **it).count();
+    if moved == 0 {
+        return Ok(false);
+    }
+    // The new place of each local symbol: the others keep their order, then those made global.
+    let kept = locals - moved;
+    let mut new_index = vec![0u32; locals];
+    let (mut next_kept, mut next_moved) = (0, kept);
+    for (index, promote) in promoted.iter().enumerate() {
+        let place = if *promote { &mut next_moved } else { &mut next_kept };
+        new_index[index] = u32::try_from(*place)?;
+        *place += 1;
+    }
+    let renumber = |index: u32| -> u32 {
+        new_index.get(index as usize).copied().unwrap_or(index)
+    };
+    let table_bytes = data[symtab.offset..symtab.offset + locals * SYM].to_vec();
+    for (index, promote) in promoted.iter().enumerate() {
+        let to = symtab.offset + new_index[index] as usize * SYM;
+        data[to..to + SYM].copy_from_slice(&table_bytes[index * SYM..(index + 1) * SYM]);
+        if *promote {
+            data[to + 4] = (elf::STB_GLOBAL << 4) | (data[to + 4] & 0xf);
+            data[to + 5] = (data[to + 5] & !3) | elf::STV_HIDDEN;
         }
     }
-    let mut out = Vec::new();
-    builder.write(&mut out)?;
-    Ok(Some(out))
+    data[symtab.at + 0x2c..symtab.at + 0x30].copy_from_slice(&u32::try_from(kept)?.to_le_bytes());
+    let table = u32::try_from(table)?;
+    for header in &headers {
+        if header.link != table {
+            continue;
+        }
+        match header.kind {
+            elf::SHT_RELA | elf::SHT_REL => {
+                let size = if header.kind == elf::SHT_RELA { 24 } else { 16 };
+                for entry in 0..header.size / size {
+                    let at = header.offset + entry * size + 8;
+                    let r_info = u64_at(data, at)?;
+                    let symbol = renumber((r_info >> 32) as u32);
+                    let r_info = (u64::from(symbol) << 32) | (r_info & 0xffff_ffff);
+                    data[at..at + 8].copy_from_slice(&r_info.to_le_bytes());
+                }
+            }
+            elf::SHT_GROUP => {
+                let symbol = renumber(header.info);
+                data[header.at + 0x2c..header.at + 0x30].copy_from_slice(&symbol.to_le_bytes());
+            }
+            elf::SHT_SYMTAB_SHNDX => {
+                let shndx = data[header.offset..header.offset + locals * 4].to_vec();
+                for (index, _) in promoted.iter().enumerate() {
+                    let to = header.offset + new_index[index] as usize * 4;
+                    data[to..to + 4].copy_from_slice(&shndx[index * 4..index * 4 + 4]);
+                }
+            }
+            SHT_LLVM_ADDRSIG => {
+                if header.flags & u64::from(elf::SHF_EXCLUDE) == 0 {
+                    anyhow::bail!("LLVM's table of significant addresses is linked");
+                }
+                data[header.at + 4..header.at + 8]
+                    .copy_from_slice(&elf::SHT_PROGBITS.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
 }
 
 /// Whether each section of a 64-bit Mach-O object, in the order symbols number them from 1,
@@ -484,7 +618,7 @@ mod tests {
     /// it; the memory a static points to, and what is not Rust's, stay as they are.
     #[test]
     fn a_static_private_to_rustcs_elf_object_is_made_a_hidden_global() {
-        use object::{ObjectSection as _, RelocationTarget, SymbolFlags as Flags, elf};
+        use object::{ObjectComdat as _, ObjectSection as _, RelocationTarget, SymbolFlags as Flags, elf};
         let mut object = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
         let data = object.section_id(object::write::StandardSection::Data);
         let constant = object.section_id(object::write::StandardSection::ReadOnlyData);
@@ -531,6 +665,37 @@ mod tests {
                 },
             )
             .unwrap();
+        object
+            .add_relocation(
+                text,
+                object::write::Relocation {
+                    offset: at + 8,
+                    symbol: ids[2],
+                    addend: -4,
+                    flags: object::RelocationFlags::Elf { r_type: elf::R_X86_64_PC32 },
+                },
+            )
+            .unwrap();
+        // rustc's objects have section groups (COMDAT), whose signature may be a local symbol
+        // that moves when the statics before it are made global.
+        let grouped =
+            object.add_section(Vec::new(), b".text.grouped".to_vec(), object::SectionKind::Text);
+        let at = object.append_section_data(grouped, &[0x90; 4], 4);
+        let signature = object.add_symbol(Symbol {
+            name: b"_RNvCs1234_3app7grouped".to_vec(),
+            value: at,
+            size: 4,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(grouped),
+            flags: SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol: signature,
+            sections: vec![grouped],
+        });
         let object = object.write().unwrap();
         let members = [("lib.rmeta", &b"rust metadata"[..]), ("app.app.1-cgu.0.rcgu.o", &object)];
         let members: Vec<_> = members
@@ -566,9 +731,16 @@ mod tests {
             assert_eq!(st_other & 3 == elf::STV_HIDDEN, shared, "{name}");
         }
         let text = read.section_by_name(".text").unwrap();
-        let (_, relocation) = text.relocations().next().unwrap();
-        let RelocationTarget::Symbol(target) = relocation.target() else { panic!() };
-        assert_eq!(read.symbol_by_index(target).unwrap().name(), Ok(symbols[0].0));
+        let targets: Vec<_> = text
+            .relocations()
+            .map(|(_, relocation)| {
+                let RelocationTarget::Symbol(target) = relocation.target() else { panic!() };
+                read.symbol_by_index(target).unwrap().name().unwrap()
+            })
+            .collect();
+        assert_eq!(targets, [symbols[0].0, symbols[2].0]);
+        let group = read.comdats().next().unwrap();
+        assert_eq!(read.symbol_by_index(group.symbol()).unwrap().name(), Ok("_RNvCs1234_3app7grouped"));
         // A file with nothing left to share is linked as it is.
         assert!(share_elf(members[1].data(&*shared).unwrap()).unwrap().is_none());
     }

@@ -47,7 +47,7 @@ intern.workspace = true
 memmap2 = "0.9"
 wasmparser = { version = "0.236", default-features = false, features = ["std"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
-object = { version = "0.37", default-features = false, features = ["read", "write", "build", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
+object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 # Writes an rlib again whose objects had statics made linkable (`weaken::shared`): rustc's own
 # archive writer.
 ar_archive_writer = "0.5.3"

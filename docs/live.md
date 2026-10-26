@@ -95,8 +95,10 @@ reads as never set in ours, and a counter the allocator bumps reads zero. So:
   size, a Mach-O one by its debug information's place for the variable: one address and no
   `DW_OP_piece`). On Apple's linker the copies of rustc's objects (`weaken.rs`) make a symbol
   of a static that is private to its object a private external, so that ours can link to it;
-  ELF has no such copy. A static with state whose copy can't be shared (one private to its
-  object on Linux, one LLVM split into several parts or into a `bool`, a part with no debug
+  on ELF, `weaken::shared` copies rustc's objects with such a symbol made a hidden global (in
+  place: the symbol table's locals are reordered and what numbers them, relocations and a
+  section group's signature, renumbered, as object's ELF builder refuses section groups). A
+  static with state whose copy can't be shared (one LLVM split into several parts or into a `bool`, a part with no debug
   information to tell it whole) is not copied either: the function that refers to it is left
   to rustc, saying why (``static `X` with state, whose copy in rustc's code (`...`) ...``),
   rather than split the state with nothing to tell. `harness/renamedstatics.py` checks both
