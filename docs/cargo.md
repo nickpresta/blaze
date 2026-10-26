@@ -166,8 +166,12 @@ in a sandbox.
 run them. In it the machine's files are read-only; the workspace and the target directory are
 as they are, but what a test writes there is kept to the run and gone when it ends; `/tmp`,
 `/var/tmp` and `/dev/shm` (on macOS the temporary directory) start empty; there is no network
-but the sandbox's own loopback; and the environment is fixed. A write outside gets the error a
-read-only file system gives, and a connection to anything but loopback is refused.
+but the sandbox's own loopback, and no Unix socket but those the run makes itself; and the
+environment is fixed. A write outside gets the error a read-only file system gives, and a
+connection to anything but loopback is refused. The program is a session of its own, with no
+controlling terminal, so it can't push input into the terminal it was started from
+(`TIOCSTI`); Ctrl-C and `SIGTERM` reach it all the same, passed on by the sandbox's own
+process.
 
 The sandbox records what each test reached, by name: the harness tells it, before and after
 each test, which test the thread is running. Of a test executable that fails, the note under
@@ -185,7 +189,8 @@ unsandboxed-tests = ["tests::writes_home"]    # or these, by libtest's names
 
 Any other key there is an error. The tests named run in a second run of the executable,
 outside, after the sandboxed one (libtest's `--exact` and `--skip` split them); `-v` says
-which and why. `RA_JIT_SANDBOX=off` runs every test of the command outside, as cargo does.
+which and why. `RA_JIT_SANDBOX=off` runs every test of the command outside, as cargo does
+(`BLAZE_SANDBOX`, when set, wins over it, for tests, build scripts and proc macros alike).
 
 Where no sandbox can be made, `cargo ra-jit test` stops before any test runs, says why and how
 to fix it, and exits 101. It does not go on outside with a warning: a run that did would break,
@@ -195,15 +200,48 @@ in a long log is not seen. `RA_JIT_SANDBOX=off` is the explicit way to run outsi
 On Linux the sandbox is user, mount, network, IPC and PID namespaces: the machine bound
 read-only, overlays for the workspace and target directory, tmpfs for the empty directories, a
 network namespace with only loopback up, and a seccomp filter whose supervisor reads the paths
-asked for. It needs namespaces a user can make; Ubuntu's AppArmor stops them unless
-`kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says. A filter is only
-installed when the run is recorded, and then notifies only writes, the network and the
-harness's marks unless reads are recorded too (`affected`).
+asked for. `/run` starts empty too, but for the links at its top (NixOS's `PATH` goes through
+`/run/current-system`), and so does the Nix daemon's socket directory: a network namespace
+hides abstract sockets but not the machine's Unix sockets (the Docker, D-Bus, systemd, Nix
+daemon and agents' sockets of `/run` and `/run/user/$UID`), which would let a test have a daemon
+outside do what it may not. It needs namespaces a user can make; Ubuntu's AppArmor stops them
+unless `kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says. A filter is
+installed on every run. It refuses `TIOCSTI` and `TIOCLINUX` (`EPERM`); `io_uring_setup`
+(`ENOSYS`, as a kernel built without it answers and as Docker's default profile refuses it:
+seccomp never sees an `io_uring` operation, so a ring would read, write and connect past the
+record and the socket check, and libraries fall back to plain calls); and the calls of another
+architecture's table (32-bit or x32 calls on x86-64, `ENOSYS`), which the filter's numbers
+don't name. It asks the supervisor about each `connect` and each `sendto` with an address: one
+to a Unix socket outside the overlays, the writable directories and the empty ones, with every
+link on its path followed as the program sees them, is refused (`EACCES`) and recorded as an
+`N` line, `unix:` and the path. When the run is recorded it also notifies writes, the network
+and the harness's marks, and reads too when they are recorded (`affected`).
 
 On macOS the sandbox is Seatbelt, applied with `sandbox_init_with_parameters` in the child
 before it runs the program (as Nix does), and needs no root: a profile that allows everything
-but writes (allowed only to the sandbox's scratch directory and a few of `/dev`) and the
-network (loopback and Unix sockets only). An interposer library ra-jit builds and loads with
+but writes (allowed only to the sandbox's scratch directory, the writable directories and the
+null and random devices, not a terminal by name), the network (loopback, and Unix sockets
+below the scratch and writable directories only, which keeps out `mDNSResponder`, `syslog`,
+`usbmuxd` and every other daemon's) and Mach services. A service runs outside the sandbox and
+writes for whoever asks: `cfprefsd` wrote a test's `defaults write` into
+`~/Library/Preferences`, and launchd, LaunchServices and the background task manager take
+jobs and login items. So every lookup is refused but these, which only answer or log:
+
+| service | for |
+|---|---|
+| `com.apple.system.opendirectoryd.libinfo`, `.membership` | `getpwuid`, `getgrgid`, groups (Nix allows the first) |
+| `com.apple.system.notification_center` | libSystem's notifications (time zone, network changes) |
+| `com.apple.logd`, `com.apple.diagnosticd`, `com.apple.system.logger` | `os_log`, `syslog`, what a crash reports |
+| `com.apple.FSEvents` | watching files (the `notify` crate) |
+| `com.apple.trustd`, `com.apple.trustd.agent` | checking a certificate against the system's roots (Nix allows these too) |
+| `com.apple.MTLCompilerService` (an XPC service) | Metal compiling a library from source at run time |
+
+They were found on 2026-10-26 (macOS 27, M5 Max) by running, under a profile that refused
+every lookup, the C toolchain (`cc`, `ld`), `xcrun metal` and `metallib` (which need none), a
+Metal program that compiles a kernel at run time and dispatches it (the compiler service), an
+FSEvents stream (`FSEvents`) and `getpwuid` (`libinfo`); a cold `cargo ra-jit build` of a
+workspace with `ring`, `cc`, `serde` and a build script that runs `xcrun metal` builds under
+the list, and a build script's `defaults write` and `launchctl submit` fail. An interposer library ra-jit builds and loads with
 `DYLD_INSERT_LIBRARIES` records what is read, makes the workspace and target directory
 copy-on-write (`clonefile`, whiteouts for removed files, merged listings) and gives the empty
 temporary directory. Seatbelt alone can neither record reads without root (`fs_usage` needs
@@ -234,11 +272,102 @@ the 600-test library ten to thirty times as much, so there is none. On
 macOS a stat under the interposer goes from 0.8 to 1.1 µs, and to 3 to 5 µs on a workspace
 whose overlay has been written.
 
-What is left: doctests run in rustdoc's process and are not sandboxed; Linux does not stop a
-connection to a Unix socket outside, `io_uring` gets past seccomp, and `openat2` always counts
-as a write; Windows has no sandbox yet (its CI runs with `RA_JIT_SANDBOX=off`). The plan is
-[#257](https://github.com/indexable-inc/blaze/issues/257); build scripts and proc macros are
-[#147](https://github.com/indexable-inc/blaze/issues/147).
+What is left: doctests run in rustdoc's process and are not sandboxed; Windows has no sandbox
+yet (its CI runs with `RA_JIT_SANDBOX=off`). On Linux `openat2` always counts as a write; the
+check of a Unix socket's path reads the address from the program's memory and follows its
+links before the call goes on, so a second thread that changes the address, or a link swapped
+between the check and the call, gets past it (seccomp's notifications can't be a security
+boundary for pointers; the empty `/run`, `/tmp` and Nix socket directory are what keeps the
+usual daemons out of reach whatever the program names); and a `sendmsg` with an address is only
+asked about when the run is recorded, so a datagram to a Unix socket outside those directories
+is not refused in a run that records nothing. A test that needs `io_uring`, a 32-bit helper
+program or a terminal of its own (`/dev/tty`, or `/dev/ptmx` on macOS) runs outside
+(`unsandboxed-tests`). On macOS a test that makes raw system calls gets past the interposer's
+recording (above); Metal's compiler service and the log write outside on the program's behalf
+(the shader cache, the system log), as the allowed services do. The plan is
+[#257](https://github.com/indexable-inc/blaze/issues/257). Build scripts and proc macros run
+in the same sandbox, below.
+
+### Build scripts and proc macros run in a sandbox
+
+Every build script blaze's cargo runs, the workspace's and its dependencies', whoever compiled
+it (ra-jit or rustc), and the daemon's own reruns of one, runs in the sandbox tests run in
+([#147](https://github.com/indexable-inc/blaze/issues/147)): `cargo/script_sandbox.rs` is the
+one place a script is run. A script's environment is the whole of what cargo gave it (`PATH`,
+`CC`, `TARGET`, the jobserver's descriptors and the rest); the machine is read-only; it writes
+its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
+should not modify any files outside of that directory"); the temporary directories start empty;
+there is no network but the sandbox's own loopback. Its package's directory, the workspace and
+the target directory are seen as they are, even below `/tmp` or `/dev/shm`. On macOS the
+per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`, `/var/folders/../C`) is writable
+too: clang's module cache, `xcrun`'s and the Metal compiler's live there, are found by
+`confstr` and not by a variable a private one could be named in, and check what they cache.
+Cargo's own rules for running a script again are unchanged.
+
+A script that fails having been refused a write or a connection says so under its output:
+
+    note: the build script of `sys-crate` failed in the sandbox, which refused it writing `/home/me/ws/sys-crate/src/bindings.rs` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-build-scripts = ["sys-crate"]` under `[workspace.metadata.blaze.sandbox]` in /home/me/ws/Cargo.toml (or `build-script = false` under `[package.metadata.blaze.sandbox]` in its own manifest, for a package of the workspace), or `RA_JIT_SANDBOX=off` for every build script and test of the command
+
+The ways out, in the workspace's root manifest, which is the only one a dependency from a
+registry can be named in:
+
+```toml
+[workspace.metadata.blaze.sandbox]
+unsandboxed-build-scripts = ["hegeltest", "flecs_ecs_sys"]   # by package name
+unsandboxed-proc-macros = ["sqlx-macros"]                    # by package name
+```
+
+and, for a package of the workspace, in its own manifest:
+
+```toml
+[package.metadata.blaze.sandbox]
+build-script = false
+```
+
+Any other key in either table is an error, and so is a value that is not a list of names (a
+`bool` for `build-script`). A package from a registry or git can't take itself out with its own
+manifest. `RA_JIT_SANDBOX=off` runs every build script, proc macro and test outside, as cargo
+does. Where no sandbox can be made, the script fails with why and the same way out, as a test
+run does; Windows has no sandbox yet and runs scripts outside.
+
+What a script read is recorded, and decides one thing only. Cargo runs a script again when a
+file of its `rerun-if-changed` changed, when a variable of `rerun-if-env-changed` did, and,
+when it named neither, when any file of its package did. In that last case a run whose record
+is whole (macOS records nothing of a program it protects, such as `/bin/sh` or `/usr/bin/cc`,
+and the record then says it is not whole) and whose every read path is as it was stands for a
+run now: the store keeps it with what it read, and cargo's rerun is answered from the store
+without running it; the daemon's check of the script (`ra-jit-reads` beside its `OUT_DIR`)
+needs no run either. A script that named what it reads runs again exactly when cargo says, and
+one whose record is not whole whenever cargo would run it.
+
+Every proc-macro server a load starts, the toolchain's and ra-jit's own, runs in the sandbox
+too, writing nothing: no `OUT_DIR`, only the empty temporary directories. A server is started
+once, when a load first needs it, and serves every expansion after, so the sandbox costs its
+start (about 8 ms on Linux, 25 ms on macOS) and nothing per expansion. The packages of
+`unsandboxed-proc-macros` are expanded by servers of their own, started outside. The hook is
+`proc_macro_api::wrap` (the command a server is started with) and
+`load_cargo::unsandboxed_macros_with` (which libraries get the outside servers).
+
+What it costs, measured on 2026-10-26 (cold builds with an empty store and target
+directory, `RA_JIT_SANDBOX=off` against the default; a server's start is its start and exit with
+stdin closed, the median of 20):
+
+| | Linux x86-64 (dev host, 16 cores) | macOS (M5 Max, loaded) |
+|---|---|---|
+| a proc-macro server's start, outside | 6.7 ms | 30 ms |
+| the same, in the sandbox | 14.9 ms | 54 ms |
+| a 4-package workspace with `ring`, `cc` and `serde`, cold, outside | 27.3 s | 15.4 s |
+| the same, in the sandbox | 23.4 s | 15.7 s |
+| the game's `space-server` (72 build scripts, 6 of them C or toolchain ones), cold, outside | | 441 s |
+| the same, in the sandbox | | 415 s |
+
+A build script's sandbox costs one launch (8 ms on Linux, 38 ms on macOS, as for a test
+executable), which is lost in a cold build's noise.
+
+What is left: the server's `--version` question runs outside (it loads no macro); a server
+sees the directories of the libraries of the loads before it started, so a workspace below
+`/tmp` loaded later by the same daemon is not seen by it on Linux; doctests and the
+`blaze-build-script` crate's own runner (`harness/scripts.py` only) are not sandboxed.
 
 ### Running only the tests an edit reached
 

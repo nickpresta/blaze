@@ -221,6 +221,7 @@ fn outside(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow
         }
     }
     let status = compiler.status()?;
+    stand_in_front_of_rustcs(unit.as_ref(), status)?;
     if let Some(unit) = unit.filter(|it| status.success() && !it.script) {
         let record = unit.as_record(stamp_now(), Vec::new(), None);
         if record.is_rlib() || record.runs_in_build() {
@@ -235,10 +236,12 @@ fn outside(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow
 /// libraries rustc compiles are then described for the proc macros that link them. The code
 /// to end with.
 fn for_load(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::Result<i32> {
-    if !own_macro::wanted() {
-        return Ok(compiler.status()?.code().unwrap_or(1));
-    }
     let unit = Unit::of(args);
+    if !own_macro::wanted() {
+        let status = compiler.status()?;
+        stand_in_front_of_rustcs(unit.as_ref(), status)?;
+        return Ok(status.code().unwrap_or(1));
+    }
     let record = unit.as_ref().map(|it| it.as_record(stamp_now(), Vec::new(), None));
     if let Some((unit, record)) =
         unit.as_ref().zip(record.as_ref()).filter(|(_, it)| it.is_proc_macro())
@@ -262,6 +265,7 @@ fn for_load(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyho
     let text: Vec<String> = args.iter().filter_map(|it| it.to_str().map(str::to_owned)).collect();
     own_macro::rustc_first(rustc, &text, &std::env::current_dir()?)?;
     let status = compiler.status()?;
+    stand_in_front_of_rustcs(unit.as_ref(), status)?;
     if let Some((unit, record)) = unit.as_ref().zip(record.as_ref())
         && status.success()
         && (record.is_rlib() || record.runs_in_build())
@@ -269,6 +273,21 @@ fn for_load(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyho
         record.write_described(&unit.records)?;
     }
     Ok(status.code().unwrap_or(1))
+}
+
+/// Has cargo run a build script rustc linked, `unit` when it is one and `status` says rustc
+/// did, through `ra-jit build-script` as one of ra-jit's is ([`Unit::record`]): every build
+/// script runs in the sandbox, whoever compiled it.
+fn stand_in_front_of_rustcs(
+    unit: Option<&Unit>,
+    status: std::process::ExitStatus,
+) -> anyhow::Result<()> {
+    let Some(unit) = unit.filter(|it| it.script && status.success()) else { return Ok(()) };
+    let record = unit.as_record(0, Vec::new(), None);
+    match record.outputs().first() {
+        Some(linked) => script::stand_in_front(linked),
+        None => Ok(()),
+    }
 }
 
 /// Starts a process that has the daemon load the build of the cargo above this one, when

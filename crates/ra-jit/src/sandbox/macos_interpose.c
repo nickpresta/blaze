@@ -49,6 +49,7 @@
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -675,6 +677,13 @@ static void fork_after(void) {
     os_unfair_lock_unlock(&seen_lock);
 }
 
+// The child's thread is another Mach thread than the one that took the locks, and an unfair
+// lock aborts the process that unlocks one it does not own: the child starts them afresh.
+static void fork_child(void) {
+    cwd_lock = OS_UNFAIR_LOCK_INIT;
+    seen_lock = OS_UNFAIR_LOCK_INIT;
+}
+
 static void image_added(const struct mach_header *header, intptr_t slide) {
     (void)slide;
     Dl_info info;
@@ -786,7 +795,7 @@ __attribute__((constructor)) static void start(void) {
     else if (theirs) unsetenv("DYLD_INSERT_LIBRARIES");
     unsetenv("__RA_JIT_SANDBOX");
     unsetenv("__RA_JIT_SANDBOX_EXEC");
-    pthread_atfork(fork_prepare, fork_after, fork_after);
+    pthread_atfork(fork_prepare, fork_after, fork_child);
     alive = 1;
     if (record_reads) _dyld_register_func_for_add_image(image_added);
     busy = 0;
@@ -1235,13 +1244,21 @@ INTERPOSE(my_fcntl_nocancel, fcntl_nocancel)
 
 static _Atomic uint32_t execs;
 
+// How many entries `environment` adds to those it keeps: `DYLD_INSERT_LIBRARIES`, the
+// directory and the nonce.
+#define ADDED 3
+
 // `envp` with this library's variables in it, which a program that clears its child's
 // environment would otherwise take away, and the nonce `nonce` for the child to say it loaded.
+// `out` has `room` entries, which is `count(envp) + ADDED + 1`: every entry of `envp` kept, the
+// ones added and the terminator.
 static void environment(char *const envp[], char **out, size_t room, char *nonce_var,
                         char *insert_var, const char *nonce) {
     size_t n = 0;
     const char *theirs = NULL;
-    for (char *const *it = envp; it && *it && n + 4 < room; it++) {
+    // Never more than `count(envp)` are kept, so the guard holds for the room it is given; it
+    // keeps the additions and the terminator in bounds should it not.
+    for (char *const *it = envp; it && *it && n + ADDED + 1 < room; it++) {
         if (!strncmp(*it, "__RA_JIT_SANDBOX=", 17) || !strncmp(*it, "__RA_JIT_SANDBOX_EXEC=", 22))
             continue;
         if (!strncmp(*it, "DYLD_INSERT_LIBRARIES=", 22)) {
@@ -1259,7 +1276,7 @@ static void environment(char *const envp[], char **out, size_t room, char *nonce
     out[n++] = insert_var;
     out[n++] = env_dir;
     out[n++] = nonce_var;
-    out[n] = NULL;
+    out[n] = NULL; // n + 1 <= room: the loop left ADDED + 1 entries
 }
 
 static size_t count(char *const envp[]) {
@@ -1280,7 +1297,7 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
     BEGIN
     enum answer a = resolve(AT_FDCWD, path, READ, real, virt, &root);
     if (a == FAIL) END(-1);
-    size_t room = count(envp) + 8;
+    size_t room = count(envp) + ADDED + 1;
     char *env[room];
     char nonce[32], nonce_var[64], insert_var[PATH_MAX * 2];
     new_nonce(nonce);
@@ -1298,7 +1315,7 @@ static int spawned(pid_t *pid, const char *path, const posix_spawn_file_actions_
     struct root *root;
     enum answer a = resolve(AT_FDCWD, path, READ, real, virt, &root);
     if (a == FAIL) return errno;
-    size_t room = count(envp) + 8;
+    size_t room = count(envp) + ADDED + 1;
     char *env[room];
     char nonce[32], nonce_var[64], insert_var[PATH_MAX * 2];
     new_nonce(nonce);
@@ -1342,6 +1359,11 @@ static int my_posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_
             len = 1;
         } else if (len < PATH_MAX) {
             memcpy(candidate, at, len);
+        } else {
+            // A directory too long for a path: no program is found there.
+            if (!end) break;
+            at = end;
+            continue;
         }
         if (len + strlen(file) + 2 < PATH_MAX) {
             candidate[len] = '/';
@@ -1366,9 +1388,23 @@ INTERPOSE(my_posix_spawnp, posix_spawnp)
 // ---------------------------------------------------------------------------------------
 // The network.
 
-// The address `addr` names when it is not this machine's loopback, written to `out`.
+// How long what `outside` writes may be: a Unix socket's path and its prefix.
+#define WHERE (sizeof(((struct sockaddr_un *)0)->sun_path) + 8)
+
+// The address `addr` names when it is not this machine's loopback, written to `out` (`WHERE`
+// bytes): `unix:` and the path for a Unix socket's, which Seatbelt allows only below the
+// run's own and writable directories.
 static int outside(const struct sockaddr *addr, socklen_t len, char *out) {
     if (!addr) return 0;
+    if (addr->sa_family == AF_UNIX && len > offsetof(struct sockaddr_un, sun_path)) {
+        const struct sockaddr_un *un = (const void *)addr;
+        size_t most = len - offsetof(struct sockaddr_un, sun_path);
+        if (most > sizeof un->sun_path) most = sizeof un->sun_path;
+        size_t n = strnlen(un->sun_path, most);
+        if (n == 0) return 0;
+        snprintf(out, WHERE, "unix:%.*s", (int)n, un->sun_path);
+        return 1;
+    }
     if (addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
         const struct sockaddr_in *in = (const void *)addr;
         uint32_t ip = ntohl(in->sin_addr.s_addr);
@@ -1393,7 +1429,7 @@ static int outside(const struct sockaddr *addr, socklen_t len, char *out) {
 }
 
 static void reached(int r, const struct sockaddr *addr, socklen_t len) {
-    char where_[64];
+    char where_[WHERE];
     if (r < 0 && (errno == EPERM || errno == EACCES) && alive && outside(addr, len, where_)) {
         int saved = errno;
         note('N', where_);

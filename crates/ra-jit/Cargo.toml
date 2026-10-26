@@ -78,6 +78,7 @@ ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true
 load-cargo.workspace = true
+proc-macro-api.workspace = true
 project-model.workspace = true
 vfs.workspace = true
 triomphe.workspace = true

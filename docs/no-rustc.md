@@ -16,8 +16,11 @@ it fast, and it stays a superset of Rust on the way: every program the pinned ni
 (`harness/toolchain`) builds builds and behaves the same under ra-jit, with the real standard
 library, C dependencies, build scripts and proc macros, and what ra-jit adds (live edits, tiers) comes on top. The one
 difference allowed is that build scripts and proc macros run sandboxed
-([#147](https://github.com/indexable-inc/ra-jit/issues/147)); one that needs more than the
-sandbox allows is the only exception, and is made to work rather than refused where possible.
+([#147](https://github.com/indexable-inc/ra-jit/issues/147); they do by default since
+2026-10-26, [cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)); one that
+needs more than the sandbox allows is the only exception, and is made to work rather than
+refused where possible: the root manifest's `unsandboxed-build-scripts` and
+`unsandboxed-proc-macros` name it.
 
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
@@ -886,9 +889,12 @@ its threads happen to look). Three scripts fail under cargo for want of a system
 (openssl-sys twice, yeslogic-fontconfig-sys) and fail the same under blaze. The harness found
 two things the port missed: a `cargo check` has no artifact directory, so `target/debug` is
 not in the library path, and the certificates above. Not yet: the description filled by
-blaze's own manifest reader and resolver (the harness fills it from cargo), the run inside
-`ra-jit sandbox`, keeping runs in the store under the keys of #105, and `cargo/script.rs`,
-`inputs.rs` and `link.rs` reading output with this crate.
+blaze's own manifest reader and resolver (the harness fills it from cargo), and
+`cargo/script.rs`, `inputs.rs` and `link.rs` reading output with this crate. The scripts cargo
+runs under blaze, and the daemon's reruns, run inside `ra-jit sandbox` since 2026-10-26
+(`cargo/script_sandbox.rs`, #147), their runs kept in the store under the keys of #105, with
+what an undeclared script read; this crate's own runner, which only the harness calls, does not
+yet.
 
 **J. Proc macros compiled and loaded by ra-jit.** ([#90](https://github.com/indexable-inc/ra-jit/issues/90)) The proc-macro crate and its dependencies are
 compiled by ra-jit into a library that rust-analyzer's proc-macro server, running inside ra-jit,

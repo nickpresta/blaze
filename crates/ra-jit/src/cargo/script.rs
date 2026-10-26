@@ -6,7 +6,8 @@
 //!
 //! To run a script as cargo does, the wrapper puts a few lines of shell where rustc linked
 //! it. Cargo runs those, and they run `ra-jit build-script`, which writes down the
-//! environment and the directory cargo ran it in and becomes the script.
+//! environment and the directory cargo ran it in and runs the script. Every run, cargo's and
+//! the daemon's, is [`script_sandbox::run`]'s, in the sandbox tests run in.
 
 use std::{
     ffi::OsString,
@@ -19,6 +20,8 @@ use std::{
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+use super::{sandboxed, script_sandbox};
 
 /// The variable that names the script itself to `ra-jit build-script`.
 const REAL: &str = "RA_JIT_BUILD_SCRIPT";
@@ -98,7 +101,8 @@ pub(crate) fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()
     run_as_cargo_does(real, args)
 }
 
-/// Writes down how cargo runs the script at `real` and becomes it.
+/// Writes down how cargo runs the script at `real`, and runs it as [`script_sandbox::plan`]
+/// says, or has a run the store kept stand for it.
 pub(crate) fn run_as_cargo_does(
     real: PathBuf,
     args: impl Iterator<Item = OsString>,
@@ -111,33 +115,49 @@ pub(crate) fn run_as_cargo_does(
         env.iter().find(|(name, _)| name == "OUT_DIR").map(|(_, value)| PathBuf::from(value));
     let args: Vec<OsString> = args.collect();
     let cwd = std::env::current_dir()?;
-    let places = Places::of(&env);
-    let key = |places: Option<&Places>| {
-        out_dir.as_ref().and_then(|_| run_key(&real, &cwd, &args, &env, places))
-    };
-    let (shared, here) = (key(Some(&places)), key(None));
-    if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
-        let ran = Ran { real: real.clone(), cwd: cwd.clone(), env };
-        // Without it the script is not run again by the daemon, and cargo builds.
-        let _ = std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran)?);
-    }
     let mut script = Command::new(&real);
     script.args(&args).env_remove(REAL);
+    // Not run by cargo: there is nowhere for it to write.
+    let Some(out_dir) = out_dir else { return become_it(&mut script) };
+    let run_dir = out_dir.parent().context("an OUT_DIR at the root")?.to_owned();
+    let places = Places::of(&env);
+    let key = |places: Option<&Places>| run_key(&real, &cwd, &args, &env, places);
+    let (shared, here) = (key(Some(&places)), key(None));
+    let ran = Ran { real: real.clone(), cwd: cwd.clone(), env };
+    // Without it the script is not run again by the daemon, and cargo builds.
+    let _ = std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran)?);
+    let running = script_sandbox::Script {
+        real: &real,
+        args: &args,
+        cwd: &cwd,
+        env: &ran.env,
+        out_dir: &out_dir,
+        scratch: &run_dir,
+    };
+    let plan = script_sandbox::plan(&running)?;
     ra_jit_store::compiles_against(RUNS);
     let store =
         here.and_then(|_| ra_jit_store::Store::global_or(super::daemon::store().as_deref()));
-    let (Some(shared), Some(here), Some(store), Some(out_dir)) = (shared, here, store, out_dir)
-    else {
+    if store.is_none()
+        && let script_sandbox::Plan::Outside(_) = plan
+    {
+        script_sandbox::keep_reads(&out_dir, None);
         return become_it(&mut script);
-    };
+    }
+    let keys = shared.zip(here).zip(store);
     // A run another checkout or target directory kept, or, when what it left names where it
     // ran in a file that is no text, one of this place.
-    let kept = match store.get(&shared).and_then(|it| Kept::read(&it)) {
-        Some(kept) => Some(kept.placed(&places)),
-        None => store.get(&here).and_then(|it| Kept::read(&it)),
-    };
+    let kept = keys.as_ref().and_then(|((shared, here), store)| {
+        match store.get(shared).and_then(|it| Kept::read(&it)) {
+            Some(kept) => Some(kept.placed(&places)),
+            None => store.get(here).and_then(|it| Kept::read(&it)),
+        }
+    });
     if let Some(kept) = kept.filter(|it| it.still(&cwd)) {
         kept.restore(&out_dir)?;
+        let reads: Vec<String> = kept.reads.iter().map(|it| it.0.clone()).collect();
+        let reads = (!script_sandbox::says_what_it_reads(&kept.stdout)).then_some(&reads[..]);
+        script_sandbox::keep_reads(&out_dir, reads);
         // Cargo keeps what a script printed to stderr beside its `OUT_DIR`.
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!("ra-jit: a run the store kept");
@@ -146,11 +166,15 @@ pub(crate) fn run_as_cargo_does(
         std::io::stderr().write_all(&kept.stderr)?;
         return Ok(());
     }
-    let ran = script.stdin(Stdio::inherit()).output()?;
-    std::io::stdout().write_all(&ran.stdout)?;
-    std::io::stderr().write_all(&ran.stderr)?;
-    if ran.status.success()
-        && let Some(kept) = Kept::of(ran.stdout, ran.stderr, &out_dir, &cwd)
+    let script_sandbox::Ran { output, reads } =
+        script_sandbox::run(&running, &plan, Stdio::inherit())?;
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+    let reads = reads.filter(|_| !script_sandbox::says_what_it_reads(&output.stdout));
+    script_sandbox::keep_reads(&out_dir, reads.as_deref());
+    if output.status.success()
+        && let Some(((shared, here), store)) = keys
+        && let Some(kept) = Kept::of(output.stdout, output.stderr, &out_dir, &cwd, reads.as_deref())
     {
         store.settled();
         match kept.unplaced(&places) {
@@ -159,17 +183,28 @@ pub(crate) fn run_as_cargo_does(
         }
         store.flush();
     }
-    std::process::exit(ran.status.code().unwrap_or(1))
+    std::process::exit(output.status.code().unwrap_or(1))
 }
 
 /// What the store's runs of build scripts are kept under in place of a toolchain: what a run
 /// prints and writes is told by the script, which its key has.
-const RUNS: &str = "build script runs 1";
+const RUNS: &str = "build script runs 2";
 
 /// The variables of a run that change nothing it prints or writes: the jobs it may start, and
 /// the directories the shell that ran cargo was in, which cargo leaves as they were (it runs
-/// the script in its package's directory).
-const UNREAD: [&str; 6] = ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "NUM_JOBS", "PWD", "OLDPWD"];
+/// the script in its package's directory). Whether it runs in a sandbox changes nothing it
+/// prints or writes either: a run that the sandbox refused something fails, and a failed run
+/// is not kept.
+const UNREAD: [&str; 8] = [
+    "CARGO_MAKEFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "NUM_JOBS",
+    "PWD",
+    "OLDPWD",
+    sandboxed::VAR,
+    "BLAZE_SANDBOX",
+];
 
 /// The most a run may leave for the store to keep it.
 const MOST_KEPT: usize = 256 << 20;
@@ -303,13 +338,23 @@ struct Kept {
     /// Each file or directory of `rerun-if-changed`, as the script named it, and the digest
     /// of what it had: nothing when it was not there.
     watched: Vec<(String, Vec<u8>)>,
+    /// For a script that said nothing of what it reads, each path the sandbox saw it read, and
+    /// what [`sandboxed::digest`] said of it: the whole of its inputs, its record being whole.
+    reads: Vec<(String, String)>,
 }
 
 impl Kept {
-    /// The run that printed `stdout` and wrote `out_dir`, run in `cwd`. `None` when cargo would
-    /// run it again for a change to any file of its package, which the key does not say, or
+    /// The run that printed `stdout` and wrote `out_dir`, run in `cwd`, which read `reads` when
+    /// that is known ([`script_sandbox::Ran::reads`]). `None` when cargo would run it again for
+    /// a change to any file of its package, which neither the key nor what it read says, or
     /// when it left too much.
-    fn of(stdout: Vec<u8>, stderr: Vec<u8>, out_dir: &Path, cwd: &Path) -> Option<Kept> {
+    fn of(
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        out_dir: &Path,
+        cwd: &Path,
+        reads: Option<&[String]>,
+    ) -> Option<Kept> {
         let printed = String::from_utf8_lossy(&stdout);
         let mut watched = Vec::new();
         let mut says_what_it_reads = false;
@@ -322,9 +367,15 @@ impl Kept {
             }
             says_what_it_reads |= line.starts_with("rerun-if-env-changed=");
         }
-        if !says_what_it_reads {
-            return None;
-        }
+        // A script that said nothing is run again by cargo for any file of its package; what
+        // the sandbox saw it read, all of it, is what a run depends on.
+        let reads = match (says_what_it_reads, reads) {
+            (true, _) => Vec::new(),
+            (false, Some(reads)) => {
+                reads.iter().map(|it| (it.clone(), sandboxed::digest(Path::new(it)))).collect()
+            }
+            (false, None) => return None,
+        };
         let mut files = Vec::new();
         let mut size = stdout.len() + stderr.len();
         let mut pending = vec![out_dir.to_owned()];
@@ -346,7 +397,7 @@ impl Kept {
             }
         }
         files.sort();
-        Some(Kept { stdout, stderr, files, watched })
+        Some(Kept { stdout, stderr, files, watched, reads })
     }
 
     /// It with what stands for each place in place of it, for a run in any checkout or target
@@ -357,6 +408,7 @@ impl Kept {
         let texts = [&self.stdout, &self.stderr].into_iter();
         let files = self.files.iter().map(|it| &it.2);
         let paths = self.watched.iter().map(|it| it.0.as_bytes());
+        let paths = paths.chain(self.reads.iter().map(|it| it.0.as_bytes()));
         let names = self.files.iter().map(|it| it.0.as_bytes());
         if texts
             .chain(files)
@@ -378,11 +430,13 @@ impl Kept {
         }
         let text = |it: &str| String::from_utf8(places.unplace(it.as_bytes())).ok();
         let watched = self.watched.iter().map(|(path, digest)| Some((text(path)?, digest.clone())));
+        let reads = self.reads.iter().map(|(path, digest)| Some((text(path)?, digest.clone())));
         Some(Kept {
             stdout: places.unplace(&self.stdout),
             stderr: places.unplace(&self.stderr),
             files,
             watched: watched.collect::<Option<_>>()?,
+            reads: reads.collect::<Option<_>>()?,
         })
     }
 
@@ -402,12 +456,15 @@ impl Kept {
                 .iter()
                 .map(|(path, digest)| (text(path), digest.clone()))
                 .collect(),
+            reads: self.reads.iter().map(|(path, digest)| (text(path), digest.clone())).collect(),
         }
     }
 
-    /// Whether every file it said it reads has what it had.
+    /// Whether every file it said it reads, and every path the sandbox saw it read, has what
+    /// it had.
     fn still(&self, cwd: &Path) -> bool {
         self.watched.iter().all(|(path, digest)| watched_digest(&cwd.join(path)) == *digest)
+            && self.reads.iter().all(|(path, digest)| sandboxed::digest(Path::new(path)) == *digest)
     }
 
     /// Writes the files it left into `out_dir`, as a run would.
@@ -445,6 +502,11 @@ impl Kept {
             put(path.as_bytes());
             put(digest);
         }
+        put(&(self.reads.len() as u64).to_le_bytes());
+        for (path, digest) in &self.reads {
+            put(path.as_bytes());
+            put(digest.as_bytes());
+        }
         out
     }
 
@@ -466,7 +528,11 @@ impl Kept {
         for _ in 0..count(take(rest)?)? {
             watched.push((text(take(rest)?)?, take(rest)?.to_vec()));
         }
-        Some(Kept { stdout, stderr, files, watched })
+        let mut reads = Vec::new();
+        for _ in 0..count(take(rest)?)? {
+            reads.push((text(take(rest)?)?, text(take(rest)?)?));
+        }
+        Some(Kept { stdout, stderr, files, watched, reads })
     }
 }
 
@@ -647,7 +713,14 @@ pub(crate) fn same_run(out_dir: &Path, other: &Path) -> bool {
 /// Runs the script that wrote `out_dir` again as [`rerun_is_same`] does, and compares what
 /// it prints and writes with what a run of the same script left in `other`: another build of
 /// the package, which ran it with the same source and inputs.
+///
+/// A script that said nothing of what it reads, whose run cargo's sandbox saw read only what
+/// is as it was ([`script_sandbox::reads_unchanged`]), is not run: a run now would read the
+/// same and so print and write the same.
 pub(crate) fn rerun_matches(out_dir: &Path, other: &Path) -> Result<(), String> {
+    if script_sandbox::reads_unchanged(out_dir) && (out_dir == other || same_run(out_dir, other)) {
+        return Ok(());
+    }
     let run_dir = out_dir.parent().ok_or("a build script without a directory")?;
     let other_dir = other.parent().ok_or("a build script without a directory")?;
     let read = |dir: &Path, name: &str| {
@@ -660,18 +733,45 @@ pub(crate) fn rerun_matches(out_dir: &Path, other: &Path) -> Result<(), String> 
         format!("{}: {it}", name.display())
     })?;
     let again_dir = run_dir.join(format!("ra-jit-out-{}", std::process::id()));
+    let scratch = run_dir.join(format!("ra-jit-again-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&again_dir);
     std::fs::create_dir(&again_dir).map_err(|it| it.to_string())?;
-    let same = rerun_into(&ran, &again_dir, other, &printed);
+    let same = rerun_into(&ran, &again_dir, &scratch, other, &printed);
     let _ = std::fs::remove_dir_all(&again_dir);
+    let _ = std::fs::remove_dir_all(&scratch);
     same
 }
 
-fn rerun_into(ran: &Ran, again_dir: &Path, out_dir: &Path, printed: &[u8]) -> Result<(), String> {
-    let mut script = Command::new(&ran.real);
-    script.env_clear().envs(ran.env.iter().map(|(name, value)| (name, value)));
-    script.env("OUT_DIR", again_dir).current_dir(&ran.cwd).stdin(Stdio::null());
-    let again = script.output().map_err(|it| it.to_string())?;
+/// Runs the script as cargo ran it, but into `again_dir`, in the sandbox cargo's run was in
+/// ([`script_sandbox::run`]), with its spec and record in `scratch`.
+fn rerun_into(
+    ran: &Ran,
+    again_dir: &Path,
+    scratch: &Path,
+    out_dir: &Path,
+    printed: &[u8],
+) -> Result<(), String> {
+    let again_text = again_dir.to_str().ok_or("has a directory whose name is not text")?;
+    let env: Vec<(String, String)> = ran
+        .env
+        .iter()
+        .map(|(name, value)| match name == "OUT_DIR" {
+            true => (name.clone(), again_text.to_owned()),
+            false => (name.clone(), value.clone()),
+        })
+        .collect();
+    let script = script_sandbox::Script {
+        real: &ran.real,
+        args: &[],
+        cwd: &ran.cwd,
+        env: &env,
+        out_dir: again_dir,
+        scratch,
+    };
+    let plan = script_sandbox::plan(&script).map_err(|it| format!("{it:#}"))?;
+    let again =
+        script_sandbox::run(&script, &plan, Stdio::null()).map_err(|it| format!("{it:#}"))?;
+    let again = again.output;
     if !again.status.success() {
         return Err(format!("failed ({})", again.status));
     }
@@ -736,6 +836,8 @@ mod tests {
             ("OUT_DIR".to_owned(), out_dir.to_str().unwrap().to_owned()),
             ("WROTE".to_owned(), wrote.to_owned()),
             ("PATH".to_owned(), std::env::var("PATH").unwrap()),
+            // The test's executable is no `ra-jit sandbox`.
+            (sandboxed::VAR.to_owned(), "off".to_owned()),
         ];
         let ran = Ran { real, cwd: run_dir.clone(), env };
         std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
@@ -789,7 +891,7 @@ mod tests {
         std::fs::write(out_dir.join("deep/made.rs"), "fn made() {}").unwrap();
         std::fs::write(cwd.join("read.txt"), "one").unwrap();
         let stdout = b"cargo::rerun-if-changed=read.txt\ncargo:rustc-cfg=kept\n".to_vec();
-        let kept = Kept::of(stdout, b"a warning".to_vec(), &out_dir, &cwd).unwrap();
+        let kept = Kept::of(stdout, b"a warning".to_vec(), &out_dir, &cwd, None).unwrap();
         let bytes = kept.bytes();
         assert_eq!(Kept::read(&bytes), Some(kept));
         let kept = Kept::read(&bytes).unwrap();
@@ -799,7 +901,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(again.join("deep/made.rs")).unwrap(), "fn made() {}");
         std::fs::write(cwd.join("read.txt"), "two").unwrap();
         assert!(!kept.still(&cwd));
-        assert!(Kept::of(b"cargo:rustc-cfg=x\n".to_vec(), Vec::new(), &out_dir, &cwd).is_none());
+        let undeclared = || b"cargo:rustc-cfg=x\n".to_vec();
+        assert!(Kept::of(undeclared(), Vec::new(), &out_dir, &cwd, None).is_none());
+        // What the sandbox saw it read stands for what it would have said.
+        let read = cwd.join("read.txt").to_str().unwrap().to_owned();
+        let kept = Kept::of(undeclared(), Vec::new(), &out_dir, &cwd, Some(&[read])).unwrap();
+        assert_eq!(Kept::read(&kept.bytes()).as_ref(), Some(&kept));
+        assert!(kept.still(&cwd));
+        std::fs::write(cwd.join("read.txt"), "three").unwrap();
+        assert!(!kept.still(&cwd));
     }
 
     #[test]
@@ -855,6 +965,7 @@ mod tests {
                 package.join("read.txt").to_str().unwrap().to_owned(),
                 watched_digest(&package.join("read.txt")),
             )],
+            reads: Vec::new(),
         };
         let unplaced = named(&out, &package).unplaced(&places).unwrap();
         let read = Kept::read(&unplaced.bytes()).unwrap();

@@ -3,14 +3,22 @@
 //! namespaces, makes every mount read-only, puts the overlays, the writable directories and
 //! the empty directories in place, brings up its loopback and forks the first process of a
 //! new PID namespace. That one mounts its `/proc`, forks the program's process and waits for
-//! it; when it ends, the kernel ends every other process of the namespace. When there is a
-//! record to write, the program's process installs a seccomp filter that has the kernel tell
-//! the supervisor of the calls the record needs, hands it the filter's descriptor and runs the
-//! program; the supervisor reads each call's path or address from the program's memory, notes
-//! it and lets the call go on as it would have (the namespaces refuse what is refused). Without
-//! [`Spec::record_reads`] the filter asks only about the calls that can write (an `open` only
-//! when its flags ask to write), the network's and the test marker's, so that a program pays
-//! for nothing it reads. The program runs as the user who ran it, with no capability left.
+//! it; when it ends, the kernel ends every other process of the namespace. The first process
+//! is a session of its own, so that nothing of the sandbox has the caller's terminal as its
+//! own; the supervisor passes on the signals the terminal sends it.
+//!
+//! The program's process installs a seccomp filter, hands the supervisor the filter's
+//! descriptor and runs the program. On every run the filter refuses what the namespaces can't:
+//! pushing input into a terminal (`TIOCSTI`, `TIOCLINUX`), `io_uring` (whose operations
+//! seccomp never sees) and the calls of another architecture's table; and it has the kernel
+//! ask the supervisor about each `connect` and each `sendto` with an address, so that a Unix
+//! socket of the machine's, which a network namespace does not hide, is refused. When there is
+//! a record to write it asks about the calls the record needs too; the supervisor reads each
+//! call's path or address from the program's memory, notes it and lets the call go on as it
+//! would have (the namespaces refuse what is refused). Without [`Spec::record_reads`] it asks
+//! only about the calls that can write (an `open` only when its flags ask to write), the
+//! network's and the test marker's, so that a program pays for nothing it reads. The program
+//! runs as the user who ran it, with no capability left.
 
 use std::{
     ffi::{CString, OsString},
@@ -21,7 +29,13 @@ use std::{
 use super::{Recorder, Spec, tidy};
 
 /// The directories that are the sandbox's own: the kernel's views and the empty ones.
-const OWN: &[&str] = &["/proc", "/sys", "/dev", "/tmp", "/var/tmp"];
+const OWN: &[&str] = &["/proc", "/sys", "/dev", "/tmp", "/var/tmp", "/run"];
+
+/// The directories the sandbox mounts empty besides `/tmp`, where they are: the machine's
+/// sockets live in `/run` (`/var/run` is a link to it, or one more), and the Nix daemon's,
+/// through which a program could have the store build or keep what it likes, in its own.
+const EMPTIED: &[&str] =
+    &["/var/tmp", "/dev/shm", "/run", "/var/run", "/nix/var/nix/daemon-socket"];
 
 /// What a call does, for the record.
 #[derive(Clone, Copy)]
@@ -35,8 +49,10 @@ enum Does {
     Access(usize),
     /// Changes the file system at the paths that are marked written.
     Change,
-    /// `connect` and `bind`: the address in the second argument, its length in the third.
+    /// `bind`: the address in the second argument, its length in the third.
     Address,
+    /// `connect`, whose address is as `bind`'s: asked about on every run, for its Unix socket.
+    Connect,
     /// `sendto`: the address in the fifth argument, none for a connected socket.
     SendTo,
     /// `sendmsg`: the address in the message the second argument points to.
@@ -92,13 +108,15 @@ const CALLS: &[Call] = &[
     // openat2's flags are in a structure the filter can't read: it is always asked about.
     call(437, &[(Some(0), 1, true)], Does::Change), // openat2
     call(439, &[(Some(0), 1, false)], Does::Access(2)), // faccessat2
-    call(42, NO_PATH, Does::Address),               // connect
+    call(42, NO_PATH, Does::Connect),               // connect
     call(44, NO_PATH, Does::SendTo),                // sendto
     call(46, NO_PATH, Does::SendMsg),               // sendmsg
     call(49, NO_PATH, Does::Address),               // bind
 ];
 #[cfg(target_arch = "x86_64")]
 const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+#[cfg(target_arch = "x86_64")]
+const NR_IOCTL: u32 = 16;
 
 #[cfg(target_arch = "aarch64")]
 const CALLS: &[Call] = &[
@@ -122,12 +140,23 @@ const CALLS: &[Call] = &[
     call(437, &[(Some(0), 1, true)], Does::Change), // openat2
     call(439, &[(Some(0), 1, false)], Does::Access(2)), // faccessat2
     call(200, NO_PATH, Does::Address),              // bind
-    call(203, NO_PATH, Does::Address),              // connect
+    call(203, NO_PATH, Does::Connect),              // connect
     call(206, NO_PATH, Does::SendTo),               // sendto
     call(211, NO_PATH, Does::SendMsg),              // sendmsg
 ];
 #[cfg(target_arch = "aarch64")]
 const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+#[cfg(target_arch = "aarch64")]
+const NR_IOCTL: u32 = 29;
+
+/// `io_uring_setup`, of the table every architecture shares from 403 on.
+const NR_IO_URING_SETUP: u32 = 425;
+/// The bit x32's calls have in their number on x86-64.
+const X32: u32 = 0x4000_0000;
+/// The ioctls that push input into a terminal, which a program could make its caller's shell
+/// run: `TIOCSTI`, and `TIOCLINUX`'s paste on a virtual console.
+const TIOCSTI: u32 = 0x5412;
+const TIOCLINUX: u32 = 0x541c;
 
 /// The flags of an `open` that ask to write.
 const WRITES: u32 = (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32;
@@ -139,6 +168,7 @@ const AT_RECURSIVE: libc::c_uint = 0x8000;
 const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 // _IOWR('!', 0, struct seccomp_notif) and _IOWR('!', 1, struct seccomp_notif_resp).
@@ -217,17 +247,24 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
         return Err(os("socketpair"));
     }
     let recorded = program.is_some() && spec.record.is_some();
-    let filter = match recorded {
-        true => Some(filter_program(spec.record_reads, sockets[1])),
-        false => None,
-    };
+    let filter = program.map(|_| filter_program(recorded, spec.record_reads, sockets[1]));
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // Before the fork, so that no signal ends this process before it passes them on; the
+    // sandbox's processes that run no program keep the handlers, and pass nothing on.
+    super::pass_signals_to(0);
     // SAFETY: the process is one thread; the child only makes system calls and exits.
     let first = unsafe { libc::fork() };
     if first < 0 {
         return Err(os("fork"));
     }
     if first == 0 {
+        // A session of its own, with no controlling terminal: nothing of the sandbox can push
+        // input into the caller's (`TIOCSTI`), which only a terminal's own session may. And
+        // gone with the supervisor, which a signal that can't be passed on ends.
+        unsafe {
+            libc::setsid();
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        }
         unsafe { libc::close(sockets[0]) };
         let made = Made { argv: &argv, env: &env, socket: sockets[1], filter: filter.as_deref() };
         let code = match sandbox(spec, uid, gid, &made, program.is_none()) {
@@ -239,6 +276,7 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
         };
         unsafe { libc::_exit(code) };
     }
+    super::pass_signals_to(first);
     unsafe { libc::close(sockets[1]) };
     let listener = received(sockets[0]);
     unsafe { libc::close(sockets[0]) };
@@ -253,6 +291,8 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
             return Err(os("waitpid"));
         }
     }
+    // Its number may be another's now.
+    super::pass_signals_to(0);
     if let (Some(file), true) = (&spec.record, recorded) {
         if listener.is_none() {
             recorder.incomplete(0, "the sandbox did not see the program run");
@@ -324,6 +364,7 @@ fn sandbox(
     // made read-only or hidden, and bound back in place after: they stay the directories
     // outside, written for real.
     let writable = spec.writable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
+    let readable = spec.readable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
     let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
     // SAFETY: `attr` is a `struct mount_attr` of the size given.
     if unsafe {
@@ -365,9 +406,30 @@ fn sandbox(
     let staged = opened(staging)?;
     tmpfs(staging)?;
     // The other empty directories go in place before the overlays too: a workspace or a
-    // `TMPDIR` under `/dev/shm` is mounted again inside its empty one.
-    for dir in ["/var/tmp", "/dev/shm"].map(Path::new).iter().filter(|it| it.is_dir()) {
+    // `TMPDIR` under `/dev/shm` is mounted again inside its empty one. Only a directory is
+    // (`/var/run` is most often a link to `/run`). The links at the top of `/run` are made
+    // again in the empty one: NixOS's `PATH` goes through `/run/current-system`, its drivers
+    // through `/run/opengl-driver`, and a link reaches no socket that is not seen anyway.
+    for dir in EMPTIED.iter().map(Path::new) {
+        if !dir.symlink_metadata().is_ok_and(|it| it.is_dir()) {
+            continue;
+        }
+        let links: Vec<(PathBuf, PathBuf)> = match *dir == *Path::new("/run") {
+            true => std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|it| it.file_type().is_ok_and(|it| it.is_symlink()))
+                .filter_map(|it| Some((it.path(), std::fs::read_link(it.path()).ok()?)))
+                .collect(),
+            false => Vec::new(),
+        };
         tmpfs(dir)?;
+        for (link, to) in links {
+            std::os::unix::fs::symlink(&to, &link).map_err(|error| {
+                format!("{} in the empty {}: {error}", link.display(), dir.display())
+            })?;
+        }
     }
     let by_fd = |fd: &std::os::fd::OwnedFd, rest: &str| {
         PathBuf::from(format!("/proc/self/fd/{}{rest}", std::os::fd::AsRawFd::as_raw_fd(fd)))
@@ -377,6 +439,16 @@ fn sandbox(
         let (upper, work) =
             (by_fd(&staged, &format!("/{at}/upper")), by_fd(&staged, &format!("/{at}/work")));
         overlay(dir, &by_fd(lower, ""), &upper, &work)?;
+    }
+    // The readable directories are bound back in place, read-only as their mount now is, where
+    // an empty directory hid them; the writable ones go on top.
+    for (dir, fd) in spec.readable.iter().zip(&readable) {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        let (from, to) = (c(&by_fd(fd, "")), c(dir));
+        let flags = libc::MS_BIND | libc::MS_REC;
+        if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), none, flags, std::ptr::null()) } < 0 {
+            return Err(os(&format!("{} seen read-only", dir.display())));
+        }
     }
     for (dir, fd) in spec.writable.iter().zip(&writable) {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
@@ -403,7 +475,7 @@ fn sandbox(
             return Err(os(&format!("{} written for real (mount_setattr)", dir.display())));
         }
     }
-    drop((lowers, staged, writable));
+    drop((lowers, staged, writable, readable));
     // A `TMPDIR` in one of the empty directories is there, empty as they are.
     let tmp = spec.env.iter().find(|(name, _)| name == "TMPDIR").map(|(_, it)| Path::new(it));
     if let Some(tmp) =
@@ -421,6 +493,8 @@ fn sandbox(
         return Err(os("fork"));
     }
     if init == 0 {
+        // Gone with the sandbox's first process, and the whole namespace with it.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
         let code = match first_process(&cwd, made, probe) {
             Ok(code) => code,
             Err(error) => {
@@ -556,15 +630,21 @@ fn exec(made: &Made<'_>) -> String {
     std::io::Error::last_os_error().to_string()
 }
 
-/// The seccomp filter that has the kernel ask the supervisor about the calls of [`CALLS`] the
-/// record needs: all of them when `reads`, otherwise those that can write, the network's and
-/// `access` with `F_OK` (the test marker). A `sendmsg` on `socket` is never asked about: it
-/// is how the filter's own descriptor reaches the supervisor, after the filter is installed
-/// and before anything listens. (A program that later has a socket of the same number sends
-/// on it unrecorded; the network namespace has only the loopback, so it reaches nothing.)
-fn filter_program(reads: bool, socket: libc::c_int) -> Vec<libc::sock_filter> {
+/// The seccomp filter of a run. On every run it refuses `TIOCSTI` and `TIOCLINUX`
+/// (`EPERM`), `io_uring_setup` and another architecture's calls (`ENOSYS`, as a kernel without
+/// them answers, so that a program falls back to the calls seccomp sees), and has the kernel
+/// ask the supervisor about each `connect` and each `sendto` with an address. When the run is
+/// `recorded` it asks about the calls of [`CALLS`] the record needs too: all of them when
+/// `reads`, otherwise those that can write, the network's and `access` with `F_OK` (the test
+/// marker). A `sendmsg` on `socket` is never asked about: it is how the filter's own
+/// descriptor reaches the supervisor, after the filter is installed and before anything
+/// listens. (A program that later has a socket of the same number sends on it unasked; the
+/// network namespace has only the loopback, so it reaches no address outside, and a Unix
+/// socket of the machine's by `sendmsg` is the residual docs/cargo.md names.)
+fn filter_program(recorded: bool, reads: bool, socket: libc::c_int) -> Vec<libc::sock_filter> {
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
+    const JGE_K: u16 = 0x35;
     const JSET_K: u16 = 0x45;
     const RET_K: u16 = 0x06;
     let insn = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
@@ -574,35 +654,51 @@ fn filter_program(reads: bool, socket: libc::c_int) -> Vec<libc::sock_filter> {
     let high = |arg: usize| 20 + 8 * arg as u32;
     let (notify, allow) =
         (insn(RET_K, 0, 0, SECCOMP_RET_USER_NOTIF), insn(RET_K, 0, 0, SECCOMP_RET_ALLOW));
+    let errno = |it: i32| insn(RET_K, 0, 0, SECCOMP_RET_ERRNO | it as u32);
     let mut program = vec![
         insn(LD_W_ABS, 0, 0, 4), // the architecture
         insn(JEQ_K, 1, 0, ARCH),
-        allow,
+        errno(libc::ENOSYS),
         insn(LD_W_ABS, 0, 0, 0), // the call
+        insn(JGE_K, 0, 1, X32),
+        errno(libc::ENOSYS),
+        // `ioctl`'s request is an `unsigned int`: the kernel reads the low half alone.
+        insn(JEQ_K, 0, 5, NR_IOCTL),
+        insn(LD_W_ABS, 0, 0, low(1)),
+        insn(JEQ_K, 2, 0, TIOCSTI),
+        insn(JEQ_K, 1, 0, TIOCLINUX),
+        allow,
+        errno(libc::EPERM),
+        insn(JEQ_K, 0, 1, NR_IO_URING_SETUP),
+        errno(libc::ENOSYS),
+    ];
+    // A null address is a connected socket's message.
+    let sendto_with_address = vec![
+        insn(LD_W_ABS, 0, 0, low(4)),
+        insn(JEQ_K, 1, 0, 0),
+        notify,
+        insn(LD_W_ABS, 0, 0, high(4)),
+        insn(JEQ_K, 0, 1, 0),
+        allow,
+        notify,
     ];
     for call in CALLS {
-        let block = match (reads, call.does) {
-            (_, Does::SendMsg) => {
+        let block = match (recorded, reads, call.does) {
+            (_, _, Does::Connect) => vec![notify],
+            (false, _, Does::SendTo) => sendto_with_address.clone(),
+            (false, _, _) => continue,
+            (true, _, Does::SendMsg) => {
                 vec![insn(LD_W_ABS, 0, 0, low(0)), insn(JEQ_K, 0, 1, socket as u32), allow, notify]
             }
-            (true, _) | (false, Does::Change | Does::Address) => vec![notify],
-            (false, Does::Look) => continue,
-            (false, Does::Open(flags)) => {
+            (true, true, _) | (true, false, Does::Change | Does::Address) => vec![notify],
+            (true, false, Does::Look) => continue,
+            (true, false, Does::Open(flags)) => {
                 vec![insn(LD_W_ABS, 0, 0, low(flags)), insn(JSET_K, 0, 1, WRITES), notify, allow]
             }
-            (false, Does::Access(mode)) => {
+            (true, false, Does::Access(mode)) => {
                 vec![insn(LD_W_ABS, 0, 0, low(mode)), insn(JEQ_K, 0, 1, 0), notify, allow]
             }
-            // A null address is a connected socket's message.
-            (false, Does::SendTo) => vec![
-                insn(LD_W_ABS, 0, 0, low(4)),
-                insn(JEQ_K, 1, 0, 0),
-                notify,
-                insn(LD_W_ABS, 0, 0, high(4)),
-                insn(JEQ_K, 0, 1, 0),
-                allow,
-                notify,
-            ],
+            (true, false, Does::SendTo) => sendto_with_address.clone(),
         };
         // Past the block when it is another call. Every block returns, so the call's number
         // is still what the next comparison reads.
@@ -726,22 +822,29 @@ fn answer(listener: libc::c_int, recorder: &mut Recorder) {
     if unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif) } < 0 {
         return;
     }
-    if let Some(call) = CALLS.iter().find(|it| it.nr as i32 == notif.nr) {
-        noted(&notif, call, recorder);
-    }
-    let resp =
-        NotifResp { id: notif.id, val: 0, error: 0, flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE };
+    let refused = match CALLS.iter().find(|it| it.nr as i32 == notif.nr) {
+        Some(call) => noted(&notif, call, recorder),
+        None => None,
+    };
+    let resp = match refused {
+        Some(error) => NotifResp { id: notif.id, val: 0, error: -error, flags: 0 },
+        None => {
+            NotifResp { id: notif.id, val: 0, error: 0, flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE }
+        }
+    };
     // SAFETY: `resp` is a `struct seccomp_notif_resp`. A process that ended meanwhile makes
     // it fail, which is nothing to answer.
     unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND as _, &resp) };
 }
 
-/// Notes in `recorder` what the call `notif` of `call` reaches.
-fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder) {
+/// Notes in `recorder` what the call `notif` of `call` reaches, and the error the sandbox
+/// refuses it with, if it does: a connection or a message to a Unix socket outside the
+/// sandbox's own directories, which no namespace hides.
+fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder) -> Option<i32> {
     let (pid, thread) = (notif.pid, u64::from(notif.pid));
     let address = |at: usize, len: usize| sockaddr(pid, notif.args[at], len);
-    let refused = match call.does {
-        Does::Address => address(1, notif.args[2] as usize),
+    let reached = match call.does {
+        Does::Address | Does::Connect => address(1, notif.args[2] as usize),
         Does::SendTo => address(4, notif.args[5] as usize),
         Does::SendMsg => {
             // `struct msghdr` starts with the address and its length.
@@ -757,8 +860,22 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder) {
         }
         _ => None,
     };
-    if let Some(address) = refused {
-        recorder.refused_net(thread, &address);
+    // `bind`'s Unix socket is a file it makes, which the mounts refuse where it may not.
+    let to_unix = matches!(call.does, Does::Connect | Does::SendTo | Does::SendMsg);
+    match reached {
+        Some(Address::Ip(address)) => recorder.refused_net(thread, &address),
+        Some(Address::Unix(path)) if to_unix => {
+            let path = whole(pid, None, path).and_then(|it| resolved(pid, &it));
+            match path {
+                Some(path) if recorder.may_connect(&path) => {}
+                path => {
+                    let path = path.unwrap_or_else(|| "a path the sandbox could not follow".into());
+                    recorder.refused_net(thread, &format!("unix:{path}"));
+                    return Some(libc::EACCES);
+                }
+            }
+        }
+        _ => {}
     }
     let writes = match call.does {
         Does::Open(flags) => notif.args[flags] as u32 & WRITES != 0,
@@ -779,6 +896,7 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder) {
             recorder.read(thread, &path);
         }
     }
+    None
 }
 
 /// Whether a write to `path`, outside where the program may write, is refused by the sandbox
@@ -788,9 +906,18 @@ fn refused_write(path: &str) -> bool {
     path.symlink_metadata().is_ok() || path.parent().is_some_and(|it| it.is_dir())
 }
 
-/// The address of `len` bytes at `at` in `pid`, when it is one the sandbox's network refuses:
-/// an IPv4 or IPv6 address that is neither the loopback nor unspecified, as `address:port`.
-fn sockaddr(pid: u32, at: u64, len: usize) -> Option<String> {
+/// An address a call names that the sandbox minds.
+enum Address {
+    /// An IPv4 or IPv6 address that is neither the loopback nor unspecified, as
+    /// `address:port`: the network namespace refuses it.
+    Ip(String),
+    /// A Unix socket's path, as the program named it.
+    Unix(Vec<u8>),
+}
+
+/// The address of `len` bytes at `at` in `pid`, when it is one the sandbox minds. An abstract
+/// Unix socket's (a name with a nul first) is not: it is the network namespace's own.
+fn sockaddr(pid: u32, at: u64, len: usize) -> Option<Address> {
     if at == 0 || len < 2 {
         return None;
     }
@@ -800,17 +927,66 @@ fn sockaddr(pid: u32, at: u64, len: usize) -> Option<String> {
     match family {
         libc::AF_INET if bytes.len() >= 8 => {
             let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-            (!ip.is_loopback() && !ip.is_unspecified()).then(|| format!("{ip}:{}", port()))
+            (!ip.is_loopback() && !ip.is_unspecified())
+                .then(|| Address::Ip(format!("{ip}:{}", port())))
         }
         libc::AF_INET6 if bytes.len() >= 24 => {
             let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).ok()?);
             let local = ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.to_ipv4_mapped().is_some_and(|it| it.is_loopback() || it.is_unspecified());
-            (!local).then(|| format!("[{ip}]:{}", port()))
+            (!local).then(|| Address::Ip(format!("[{ip}]:{}", port())))
+        }
+        libc::AF_UNIX => {
+            let path = bytes.get(2..)?;
+            let path = &path[..path.iter().position(|&it| it == 0).unwrap_or(path.len())];
+            (!path.is_empty()).then(|| Address::Unix(path.to_vec()))
         }
         _ => None,
     }
+}
+
+/// `path`, whole, as the process `pid` of the sandbox sees it, with every link on the way
+/// followed in its view of the file system (`/proc/PID/root`): where a connection to it goes.
+/// `None` when a part of it could not be looked at for another reason than its not being
+/// there or not being a link, which is refused. (The program may change what is there between
+/// this and its call: the residual docs/cargo.md names.)
+fn resolved(pid: u32, path: &str) -> Option<String> {
+    use std::path::Component;
+    let root = format!("/proc/{pid}/root");
+    let mut done = PathBuf::from("/");
+    let mut rest: Vec<OsString> =
+        Path::new(path).components().rev().map(|it| it.as_os_str().to_owned()).collect();
+    let mut links = 0;
+    while let Some(part) = rest.pop() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => done = PathBuf::from("/"),
+            Some(Component::ParentDir) => _ = done.pop(),
+            Some(Component::Normal(name)) => {
+                let next = done.join(name);
+                let mut at = OsString::from(&root);
+                at.push(next.as_os_str());
+                match std::fs::read_link(&at) {
+                    Ok(to) if links < 40 => {
+                        links += 1;
+                        rest.extend(to.components().rev().map(|it| it.as_os_str().to_owned()));
+                    }
+                    Ok(_) => return None,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EINVAL | libc::ENOENT | libc::ENOTDIR)
+                        ) =>
+                    {
+                        done = next
+                    }
+                    Err(_) => return None,
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(tidy(&done))
 }
 
 /// `len` bytes of `pid`'s memory at `at`, as many as are there.
@@ -858,4 +1034,36 @@ fn whole(pid: u32, dir: Option<i32>, path: Vec<u8>) -> Option<String> {
     };
     let base = std::fs::read_link(base).ok()?;
     Some(tidy(&base.join(path)))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_unix_socket_is_where_its_links_lead() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-resolved-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("abs")).unwrap();
+        std::os::unix::fs::symlink("real/../real", dir.join("rel")).unwrap();
+        std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
+        let pid = std::process::id();
+        let dir_s = super::tidy(&std::fs::canonicalize(&dir).unwrap());
+        let at = |it: &str| super::resolved(pid, &format!("{dir_s}/{it}"));
+        assert_eq!(at("abs/s.sock").as_deref(), Some(&*format!("{dir_s}/real/s.sock")));
+        assert_eq!(at("rel/s.sock").as_deref(), Some(&*format!("{dir_s}/real/s.sock")));
+        assert_eq!(at("missing/../real/s").as_deref(), Some(&*format!("{dir_s}/real/s")));
+        assert_eq!(at("loop/s"), None);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_run_refuses_terminal_input_and_io_uring() {
+        for (recorded, reads) in [(false, false), (true, false), (true, true)] {
+            let program = super::filter_program(recorded, reads, 3);
+            let has = |k: u32| program.iter().any(|it| it.k == k);
+            assert!(has(super::TIOCSTI) && has(super::TIOCLINUX));
+            assert!(has(super::NR_IO_URING_SETUP) && has(super::X32));
+            assert!(program.len() < u16::MAX as usize);
+        }
+    }
 }

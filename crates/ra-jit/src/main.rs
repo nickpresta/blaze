@@ -17,6 +17,7 @@ mod inputs;
 mod link;
 mod live;
 mod macro_list;
+mod macro_sandbox;
 mod memory;
 mod mirdump;
 mod outline;
@@ -7720,6 +7721,8 @@ fn process_wide() {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     ra_jit_expand::install();
+    // Every proc-macro server is started in the sandbox.
+    macro_sandbox::install();
     let server = cargo::own_macro::server();
     if let Some(Ok(server)) = server.and_then(Path::to_str).map(AbsPathBuf::try_from) {
         load_cargo::serve_listed_with(server);

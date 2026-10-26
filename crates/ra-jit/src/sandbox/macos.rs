@@ -4,9 +4,12 @@
 //! program, waits for it, writes the record and removes the scratch directory.
 //!
 //! Seatbelt is what enforces, in the kernel and for every process the program starts: no
-//! write but into the scratch directory, [`Spec::writable`] and the terminal's and null
-//! devices, and no network but the loopback (nor the DNS resolver's socket, which a network
-//! namespace has none of on Linux). Seatbelt can't make a write private or tell what was read,
+//! write but into the scratch directory, [`Spec::writable`] and the null devices, no network
+//! but the loopback and Unix sockets in those directories (not the DNS resolver's, which a
+//! network namespace has none of on Linux, nor any other daemon's), and no Mach service but
+//! the few that only answer or log ([`MACH_SERVICES`]): `cfprefsd`, launchd and the rest
+//! would write for the program outside. The program's process is a session of its own, with
+//! no controlling terminal to push input into. Seatbelt can't make a write private or tell what was read,
 //! so a library every process of the run loads (`DYLD_INSERT_LIBRARIES`,
 //! `macos_interpose.c`) does that from inside the process: it replaces the C library's calls
 //! that name a path, run a program or reach the network, keeps the writes under the overlays
@@ -48,27 +51,65 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// The profile: everything allowed but writing outside the run and the network beyond the
-/// loopback. Paths come in as parameters (`WRITE0`, `WRITE1`, ...), which need no quoting.
+/// The Mach services a program of the sandbox may look up; every other lookup is refused. A
+/// service runs outside the sandbox, so one that writes for its callers (`cfprefsd`'s
+/// preferences, launchd's jobs, LaunchServices' and the background task manager's login items,
+/// the keychain) would be a way out: these are the ones that only answer, or only log. Found by
+/// running the C toolchain (`cc`, `ld`), `xcrun metal` and `metallib`, a Metal program that
+/// compiles a library at run time and an FSEvents stream under a profile that refused every
+/// lookup, and adding what each needed (Nix's sandbox on macOS allows the first and the
+/// `trustd` ones).
+const MACH_SERVICES: &[&str] = &[
+    // getpwuid, getgrgid and group membership (Nix: "Allow getpwuid").
+    "(global-name \"com.apple.system.opendirectoryd.libinfo\")",
+    "(global-name \"com.apple.system.opendirectoryd.membership\")",
+    // libSystem's notifications (time zone and network changes).
+    "(global-name \"com.apple.system.notification_center\")",
+    // The unified log: `os_log`, `syslog`, what a crash or a failed assertion reports.
+    "(global-name \"com.apple.logd\")",
+    "(global-name \"com.apple.diagnosticd\")",
+    "(global-name \"com.apple.system.logger\")",
+    // Watching files (the `notify` crate on macOS).
+    "(global-name \"com.apple.FSEvents\")",
+    // Checking a certificate against the system's roots (a TLS test against a server on
+    // loopback); Nix allows these for the derivations that reach the network.
+    "(global-name \"com.apple.trustd\")",
+    "(global-name \"com.apple.trustd.agent\")",
+    // Metal's compiler, which a program that makes a library from source at run time reaches.
+    "(xpc-service-name \"com.apple.MTLCompilerService\")",
+];
+
+/// The profile: everything allowed but writing outside the run, the network beyond the
+/// loopback, a Unix socket outside the run's own and writable directories, and every Mach
+/// service but [`MACH_SERVICES`]. Paths come in as parameters (`WRITE0`, `WRITE1`, ...), which
+/// need no quoting. No terminal is written by name: what the program prints goes to the
+/// descriptors it was given, which no rule checks again.
 fn profile(writes: usize) -> String {
+    let dirs: String = (0..writes).map(|at| format!(" (subpath (param \"WRITE{at}\"))")).collect();
     let mut text = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
-    text.push_str("(allow file-write*\n");
-    for at in 0..writes {
-        text.push_str(&format!("  (subpath (param \"WRITE{at}\"))\n"));
-    }
+    text.push_str(&format!("(allow file-write*{dirs}\n"));
     text.push_str(
         "  (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\")
   (literal \"/dev/urandom\") (literal \"/dev/dtracehelper\") (literal \"/dev/stdout\")
-  (literal \"/dev/stderr\") (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\")
-  (regex #\"^/dev/fd/[0-9]+$\"))
+  (literal \"/dev/stderr\") (regex #\"^/dev/fd/[0-9]+$\"))
 (deny network*)
 (allow network-bind (local ip \"localhost:*\"))
 (allow network-inbound (local ip \"localhost:*\"))
 (allow network-outbound (remote ip \"localhost:*\"))
-(allow network* (local unix-socket) (remote unix-socket))
-(deny network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))
 ",
     );
+    // A socket's form takes one path: a rule each (two `subpath`s in one keep the first).
+    for at in 0..writes {
+        let dir = format!("(subpath (param \"WRITE{at}\"))");
+        text.push_str(&format!("(allow network-bind network-inbound (local unix-socket {dir}))\n"));
+        text.push_str(&format!("(allow network-outbound (remote unix-socket {dir}))\n"));
+    }
+    text.push_str("(deny mach-lookup)\n(allow mach-lookup");
+    for service in MACH_SERVICES {
+        text.push_str("\n  ");
+        text.push_str(service);
+    }
+    text.push_str(")\n");
     text
 }
 
@@ -120,7 +161,9 @@ fn library() -> Result<PathBuf, String> {
         .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's library in")?;
     let dir = caches.join("ra-jit/sandbox").join(env!("RA_JIT_SANDBOX_LIBRARY"));
     let file = dir.join("libra_jit_sandbox.dylib");
-    if std::fs::metadata(&file).is_ok_and(|it| it.len() == LIBRARY.len() as u64) {
+    // The name is that of the contents it should have; what is there is still compared, so a
+    // file left half written, or changed since, is written again.
+    if std::fs::read(&file).is_ok_and(|it| it == LIBRARY) {
         return Ok(file);
     }
     std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
@@ -217,6 +260,13 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
             writes.push(it);
         }
     }
+    // A readable directory is passed through as it is, not answered from an empty one: the
+    // library takes it as it takes a writable one, and Seatbelt still refuses its writes.
+    for readable in &spec.readable {
+        for it in spellings(readable) {
+            config.push_str(&format!("W\t{it}\n"));
+        }
+    }
     if recording {
         config.push_str("L\n");
         if spec.record_reads {
@@ -271,6 +321,8 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
         std::fs::write(&raw, line).map_err(|error| format!("{}: {error}", raw.display()))?;
     }
 
+    // Before the fork, so that no signal ends this process before it passes them on.
+    super::pass_signals_to(0);
     // SAFETY: the process is one thread (the command runs before anything else); the child
     // makes system calls, applies the profile and runs the program or exits.
     let child = unsafe { libc::fork() };
@@ -278,6 +330,9 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
         return Err(os("fork"));
     }
     if child == 0 {
+        // A session of its own, with no controlling terminal: nothing of the sandbox can push
+        // input into the caller's (`TIOCSTI` is refused but to the terminal's own session).
+        unsafe { libc::setsid() };
         let mut error: *mut libc::c_char = std::ptr::null_mut();
         // SAFETY: the profile and the parameters are strings ending in NUL, the parameters a
         // list of names and values ending in a null pointer.
@@ -306,12 +361,15 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
         eprintln!("ra-jit: could not run {}: {error}", argv[0].to_string_lossy());
         unsafe { libc::_exit(127) };
     }
+    super::pass_signals_to(child);
     let mut status = 0;
     while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(os("waitpid"));
         }
     }
+    // Its number may be another's now.
+    super::pass_signals_to(0);
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
